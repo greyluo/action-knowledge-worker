@@ -2,7 +2,6 @@
 import json
 import uuid
 from collections import defaultdict
-from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -263,7 +262,6 @@ async def dump_task(task_id: uuid.UUID) -> None:
         )
 
         service_entities: list[Entity] = []
-        service_edges: list[Edge] = []
         if in_service_et:
             edges_to_task: list[Edge] = list(
                 (
@@ -278,7 +276,6 @@ async def dump_task(task_id: uuid.UUID) -> None:
                 .all()
             )
             service_src_ids = {e.src_id for e in edges_to_task}
-            service_edges = edges_to_task
 
             if service_src_ids:
                 service_entities = list(
