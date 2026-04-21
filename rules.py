@@ -85,9 +85,16 @@ async def apply_inference(
     edges: list[dict[str, Any]],
     edge_type_names: list[str] | None,
     max_hops: int,
+    entity_ids: set[uuid.UUID] | None = None,
 ) -> list[dict[str, Any]]:
-    """Given a set of stored edges, augment with derived inverse + transitive edges."""
-    all_entity_ids = {uuid.UUID(e["src"]) for e in edges} | {uuid.UUID(e["dst"]) for e in edges}
+    """Given a set of stored edges, augment with derived inverse + transitive edges.
+
+    entity_ids: optional seed set of entity IDs to consider; when provided, entities
+    that have no stored edges (e.g. a resuming agent that only has inferred connections)
+    are still processed for inference. Falls back to IDs extracted from edges.
+    """
+    edge_entity_ids = {uuid.UUID(e["src"]) for e in edges} | {uuid.UUID(e["dst"]) for e in edges}
+    all_entity_ids = (entity_ids or set()) | edge_entity_ids
     derived: list[dict[str, Any]] = []
 
     for entity_id in all_entity_ids:

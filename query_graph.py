@@ -9,6 +9,18 @@ import rules as _rules
 from db import Edge, EdgeType, Entity, OntologyType, db_session
 
 
+async def _load_type_names(
+    session: AsyncSession, type_ids: set[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    """Return a mapping from OntologyType.id → OntologyType.name for the given IDs."""
+    if not type_ids:
+        return {}
+    rows = (
+        await session.execute(select(OntologyType).where(OntologyType.id.in_(type_ids)))
+    ).scalars().all()
+    return {r.id: r.name for r in rows}
+
+
 async def execute_query_graph(
     entity_type: str | None = None,
     properties: dict | None = None,
@@ -46,15 +58,18 @@ async def _query(
     if not entity_ids:
         return {"entities": [], "edges": []}
 
-    # Batch-load edge type names to avoid N+1 queries
+    # Batch-load edge type names and ontology type names to avoid N+1 queries
     et_name_map = await _load_edge_type_names(session)
+    type_name_map = await _load_type_names(session, {e.type_id for e in entity_rows})
 
     stored_edges = await _edges_among(session, entity_ids, et_ids)
-    entities_out = await _serialize_entities(session, entity_rows)
+    entities_out = _serialize_entities(entity_rows, type_name_map)
     edges_out = _serialize_stored_edges(stored_edges, et_name_map)
 
-    if apply_inference and edges_out:
-        edges_out = await _rules.apply_inference(session, edges_out, edge_types, max_hops)
+    if apply_inference and entity_ids:
+        edges_out = await _rules.apply_inference(
+            session, edges_out, edge_types, max_hops, entity_ids=entity_ids
+        )
 
     return {"entities": entities_out, "edges": edges_out}
 
@@ -113,6 +128,10 @@ async def _reachable_ids(
 
     # Recursive CTE for multi-hop — UNION (set semantics) prevents cycles in the base,
     # UNION ALL in the recursive part (guarded by depth) allows expansion.
+    # NOTE: The UNION ALL recursive term allows the same node to be visited multiple
+    # times on cyclic graphs (e.g. A→B→A→B…). The depth guard bounds this, but the
+    # intermediate working table can still be O(branching_factor^max_hops) rows. For
+    # the MVP graph size this is fine; revisit if graphs grow large.
     et_clause = "AND edge_type_id = ANY(:et_ids)" if et_ids is not None else ""
     cte_sql = text(f"""
         WITH RECURSIVE reachable(entity_id, depth) AS (
@@ -197,24 +216,19 @@ async def _edges_among(
 # ---------------------------------------------------------------------------
 
 
-async def _serialize_entities(
-    session: AsyncSession, rows: list[Entity]
+def _serialize_entities(
+    rows: list[Entity], type_name_map: dict[uuid.UUID, str]
 ) -> list[dict[str, Any]]:
-    type_cache: dict[uuid.UUID, str] = {}
-    out = []
-    for e in rows:
-        type_name = type_cache.get(e.type_id)
-        if type_name is None:
-            ot = await session.get(OntologyType, e.type_id)
-            type_name = ot.name if ot else str(e.type_id)
-            type_cache[e.type_id] = type_name
-        out.append({
+    """Serialize Entity ORM rows to dicts, resolving type names from the pre-built map."""
+    return [
+        {
             "id": str(e.id),
-            "type": type_name,
+            "type": type_name_map.get(e.type_id, str(e.type_id)),
             "properties": e.properties,
             "source_refs": e.source_refs,
-        })
-    return out
+        }
+        for e in rows
+    ]
 
 
 def _serialize_stored_edges(
