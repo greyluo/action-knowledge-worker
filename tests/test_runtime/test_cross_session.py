@@ -10,6 +10,7 @@ internally. Both begin_run calls also use real db_session() so Session 2 sees
 Session 1's committed data.
 """
 
+import json
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -56,7 +57,6 @@ def _extract_company_response() -> MagicMock:
 
 
 def _new_type_response(name: str, fields: dict, description: str) -> MagicMock:
-    import json
     return _make_llm_response(json.dumps({
         "decision": "NEW",
         "proposed": {
@@ -81,6 +81,23 @@ async def seeded():
         agent_entity_id = await run_seed(session)
         spec = await session.scalar(select(AgentSpec).where(AgentSpec.name == "demo-agent"))
         spec_id = spec.id
+
+    # Pre-test sweep: mark any orphaned in_progress Tasks as abandoned
+    # to ensure _maybe_resume_task finds a clean state
+    async with db_session() as session:
+        task_type = await session.scalar(
+            select(OntologyType).where(OntologyType.name == "Task")
+        )
+        if task_type:
+            orphans = (await session.execute(
+                select(Entity)
+                .where(Entity.type_id == task_type.id)
+                .where(Entity.properties["status"].astext == "in_progress")
+            )).scalars().all()
+            for orphan in orphans:
+                orphan.properties = {**orphan.properties, "status": "abandoned"}
+            if orphans:
+                await session.commit()
 
     cleanup_after = datetime.now(timezone.utc)
 
