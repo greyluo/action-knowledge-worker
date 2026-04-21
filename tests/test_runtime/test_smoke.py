@@ -10,6 +10,7 @@ deletes every row it created (identified by the run_id stamped on entities).
 """
 
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -84,43 +85,49 @@ def _judge_reuse_response(type_id: str) -> MagicMock:
 
 
 @pytest.fixture(scope="module")
-def smoke_run_id() -> uuid.UUID:
-    """Return a stable run_id used to stamp all entities created in this module.
-
-    Not async — just generates the ID; actual DB work happens inside the tests.
-    """
-    return uuid.uuid4()
-
-
-@pytest.fixture(scope="module")
-async def seeded(smoke_run_id: uuid.UUID):
+async def seeded():
     """Seed the main DB, yield spec/agent_entity_id, then clean up."""
     async with db_session() as session:
         agent_entity_id = await run_seed(session)
         spec = await session.scalar(select(AgentSpec).where(AgentSpec.name == "demo-agent"))
         spec_id = spec.id
 
+    cleanup_after = datetime.now(timezone.utc)
+
     yield {"spec_id": spec_id, "agent_entity_id": agent_entity_id}
 
-    # --- cleanup: delete everything created in this test module's runs ---
+    # --- cleanup: delete only runs created during this test (timestamp-scoped) ---
     async with db_session() as session:
-        # Find all runs whose spec matches (crude but safe for demo DB)
         run_rows = (
-            await session.execute(select(Run).where(Run.spec_id == spec_id))
+            await session.execute(
+                select(Run).where(
+                    Run.spec_id == spec_id,
+                    Run.started_at >= cleanup_after,
+                )
+            )
         ).scalars().all()
         run_ids = [r.id for r in run_rows]
 
+        # Collect task entity IDs from these runs before deleting runs
+        task_entity_ids = [r.in_service_of_task_id for r in run_rows if r.in_service_of_task_id]
+
         if run_ids:
-            # Edges created in these runs
+            # 1. Delete edges created in these runs
             await session.execute(
                 delete(Edge).where(Edge.created_in_run_id.in_(run_ids))
             )
-            # Entities created in these runs (excludes Task entity which has run_id=NULL)
+            # 2. Delete entities created in these runs (excludes Task entity which has run_id=NULL)
             await session.execute(
                 delete(Entity).where(Entity.created_in_run_id.in_(run_ids))
             )
 
-        # Delete provisional OntologyTypes created by the ontologist during the test
+        # 3. Delete Task entities created for these runs
+        if task_entity_ids:
+            await session.execute(
+                delete(Entity).where(Entity.id.in_(task_entity_ids))
+            )
+
+        # 4. Delete provisional OntologyTypes created by the ontologist during the test
         # (Person, Company, Deal — these are not in the seed set)
         extra_type_names = ("Person", "Company", "Deal")
         await session.execute(
@@ -129,23 +136,15 @@ async def seeded(smoke_run_id: uuid.UUID):
             .where(OntologyType.status == "provisional")
         )
 
-        # Delete runs themselves
-        if run_ids:
-            await session.execute(delete(Run).where(Run.id.in_(run_ids)))
-
-        # Task entities created_in_run_id may be NULL — delete by title prefix
-        await session.execute(
-            delete(Entity).where(
-                Entity.properties["title"].astext.like("Get information%")
-            )
-        )
-
-        # Delete OntologyEvents (no created_in_run_id — just clear entity_created events
-        # for this test run using the agent actor)
+        # 5. Delete OntologyEvents for this agent actor
         actor = f"agent:{agent_entity_id}"
         await session.execute(
             delete(OntologyEvent).where(OntologyEvent.actor == actor)
         )
+
+        # 6. Delete the runs themselves
+        if run_ids:
+            await session.execute(delete(Run).where(Run.id.in_(run_ids)))
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +153,7 @@ async def seeded(smoke_run_id: uuid.UUID):
 
 
 @pytest.mark.slow
-async def test_full_write_then_read_path(seeded, smoke_run_id):
+async def test_full_write_then_read_path(seeded):
     """End-to-end smoke: write path (ontologist) + read path (query_graph).
 
     Steps:
@@ -316,8 +315,6 @@ async def test_full_write_then_read_path(seeded, smoke_run_id):
 
     # --- Step 6: end_run ---
     async with db_session() as session:
-        # Reload spec (session-scoped objects can't be reused across sessions)
-        spec = await session.get(AgentSpec, spec_id)
         await end_run(session, ctx, messages=["OUTCOME_SUMMARY: Smoke test completed."])
 
     async with db_session() as session:
