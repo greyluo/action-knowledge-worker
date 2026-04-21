@@ -3,23 +3,17 @@ import json
 import os
 import sys
 import uuid
-from datetime import datetime
 from typing import Any
 
-# Inject worktree so we can import db, spec_factory, ontologist, etc.
-WORKTREE = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", ".worktrees", "agent-builder-mvp")
-)
-sys.path.insert(0, WORKTREE)
+# Ensure agent-core is on the path so db, spec_factory, etc. are importable.
+AGENT_CORE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "agent-core"))
+sys.path.insert(0, AGENT_CORE)
 
-# Load .env from worktree before db.py is imported (db.py's own load_dotenv
-# won't find it when CWD is backend/).
 from dotenv import load_dotenv  # noqa: E402
 
-load_dotenv(os.path.join(WORKTREE, ".env"))
+load_dotenv(os.path.join(AGENT_CORE, ".env"))
 
-import anthropic  # noqa: E402
-from fastapi import FastAPI, HTTPException  # noqa: E402
+from fastapi import FastAPI  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
@@ -41,7 +35,7 @@ app = FastAPI(title="Knowledge Worker API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://localhost:5174"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -158,6 +152,16 @@ async def get_messages(task_id: str):
         return messages
 
 
+_NAME_FIELDS = ("name", "title", "email", "domain", "company", "subject", "label", "full_name", "display_name")
+
+def _entity_display_name(props: dict, entity_id) -> str:
+    for key in _NAME_FIELDS:
+        v = props.get(key)
+        if v and isinstance(v, str) and v.strip():
+            return v.strip()
+    return str(entity_id)[:8]
+
+
 @app.get("/entities")
 async def list_entities(type: str | None = None):
     async with db_session() as session:
@@ -171,10 +175,7 @@ async def list_entities(type: str | None = None):
             {
                 "id": str(entity.id),
                 "type": otype.name,
-                "name": (entity.properties or {}).get(
-                    "name",
-                    (entity.properties or {}).get("title", str(entity.id)[:8]),
-                ),
+                "name": _entity_display_name(entity.properties or {}, entity.id),
                 "properties": entity.properties or {},
                 "source_refs": entity.source_refs or [],
                 "created_in_run_id": str(entity.created_in_run_id) if entity.created_in_run_id else None,
@@ -228,6 +229,36 @@ async def list_runs():
         ]
 
 
+@app.get("/schema/entity-types")
+async def list_entity_types():
+    async with db_session() as session:
+        types = (await session.execute(select(DbOntologyType))).scalars().all()
+        return [
+            {
+                "name": t.name,
+                "canonical_key": t.canonical_key,
+                "description": t.description if hasattr(t, "description") else None,
+            }
+            for t in types
+        ]
+
+
+@app.get("/schema/edge-types")
+async def list_edge_types():
+    async with db_session() as session:
+        types = (await session.execute(select(DbEdgeType))).scalars().all()
+        return [
+            {
+                "name": t.name,
+                "is_transitive": t.is_transitive,
+                "is_inverse_of": t.is_inverse_of,
+                "domain": t.domain,
+                "range": t.range_,
+            }
+            for t in types
+        ]
+
+
 @app.get("/runs/{run_id}/events")
 async def get_run_events(run_id: str):
     async with db_session() as session:
@@ -274,11 +305,7 @@ class ChatRequest(BaseModel):
     message: str
 
 
-async def _make_streaming_hook(run_ctx: Any, queue: asyncio.Queue):
-    from ontologist import make_ontologist_hook
-
-    ontologist_hook = make_ontologist_hook(run_ctx)
-
+async def _make_streaming_hook(queue: asyncio.Queue):
     async def hook(hook_input, session_id, hook_context):
         tool_name = (
             hook_input.get("tool_name", "")
@@ -291,9 +318,8 @@ async def _make_streaming_hook(run_ctx: Any, queue: asyncio.Queue):
             else getattr(hook_input, "tool_input", {})
         )
         await queue.put(("tool_call", {"tool": tool_name, "args": tool_input}))
-        result = await ontologist_hook(hook_input, session_id, hook_context)
         await queue.put(("tool_result", {"tool": tool_name}))
-        return result
+        return {}
 
     return hook
 
@@ -304,23 +330,19 @@ async def chat(body: ChatRequest):
 
     async def run_agent():
         try:
-            from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, HookMatcher, TextBlock, ToolUseBlock, query
-            from mock_tools import demo_server
-            from spec_factory import begin_run, end_run, get_agent_entity_id, load_spec
+            from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock, query
+            from spec_factory import begin_run, build_options_from_spec, end_run, get_agent_entity_id, load_spec
 
             async with db_session() as session:
                 spec = await load_spec(session, uuid.UUID(body.agent_id))
                 agent_entity_id = await get_agent_entity_id(session, spec.id)
                 run_ctx = await begin_run(session, body.message, spec, agent_entity_id)
 
-            streaming_hook = await _make_streaming_hook(run_ctx, queue)
+            streaming_hook = await _make_streaming_hook(queue)
 
-            options = ClaudeAgentOptions(
-                system_prompt=spec.system_prompt,
-                allowed_tools=spec.allowed_tools,
-                mcp_servers={"demo": demo_server},
-                hooks={"PostToolUse": [HookMatcher(matcher="*", hooks=[streaming_hook])]},
-                max_turns=spec.max_turns or 20,
+            options = build_options_from_spec(
+                spec, run_ctx,
+                streaming_hook=streaming_hook,
                 permission_mode="bypassPermissions",
             )
 
@@ -383,95 +405,74 @@ async def chat(body: ChatRequest):
 
 
 # ---------------------------------------------------------------------------
-# /builder/chat SSE endpoint
+# Builder endpoints
 # ---------------------------------------------------------------------------
 
-class BuilderMessage(BaseModel):
-    role: str
-    content: str
+class GenerateRequest(BaseModel):
+    description: str
 
 
-class BuilderChatRequest(BaseModel):
-    message: str
-    agent_id: str | None = None
-    history: list[BuilderMessage] = []
+@app.post("/builder/generate")
+async def builder_generate(body: GenerateRequest):
+    from builder_agent import generate_spec
+    return await generate_spec(body.description)
 
 
-BUILDER_SYSTEM = """You are an agent spec designer. Help the user define a Claude agent by asking clarifying questions one at a time about:
-- What the agent should do (its goal)
-- What tools it should have access to (choose from: fetch_company_data, fetch_email_thread, query_graph)
-- How many turns it should run (1-30)
-- A short name for the agent
-
-Once you have enough information (at minimum: goal and at least one tool), output the spec as a JSON block in this exact format (no markdown fence, no extra text after):
-
-AGENT_SPEC: {"name": "...", "system_prompt": "...", "allowed_tools": [...], "max_turns": 20}
-
-Until then, ask one question at a time."""
+class CreateAgentRequest(BaseModel):
+    name: str
+    system_prompt: str
+    capabilities: list[str] = []
 
 
-@app.post("/builder/chat")
-async def builder_chat(body: BuilderChatRequest):
-    anthropic_client = anthropic.AsyncAnthropic()
+def _spec_to_dict(spec: DbAgentSpec) -> dict:
+    return {
+        "id": str(spec.id),
+        "name": spec.name,
+        "system_prompt": spec.system_prompt,
+        "allowed_tools": spec.allowed_tools,
+        "max_turns": spec.max_turns,
+        "status": "active",
+        "icon": "🤖",
+        "entity_type_scope": [],
+    }
 
-    messages = [{"role": m.role, "content": m.content} for m in body.history]
-    messages.append({"role": "user", "content": body.message})
 
-    async def event_generator():
-        full_response = ""
-        try:
-            async with anthropic_client.messages.stream(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1024,
-                system=BUILDER_SYSTEM,
-                messages=messages,
-            ) as stream:
-                async for text in stream.text_stream:
-                    full_response += text
-                    yield f"event: token\ndata: {json.dumps({'text': text})}\n\n"
+@app.post("/agents")
+async def create_agent(body: CreateAgentRequest):
+    from builder_agent import capabilities_to_tools
+    tools = capabilities_to_tools(body.capabilities)
+    async with db_session() as session:
+        spec = DbAgentSpec(
+            name=body.name,
+            system_prompt=body.system_prompt,
+            allowed_tools=tools,
+            allowed_mcp_servers={},
+            max_turns=30,
+        )
+        session.add(spec)
+        await session.flush()
+        return _spec_to_dict(spec)
 
-            if "AGENT_SPEC:" in full_response:
-                idx = full_response.index("AGENT_SPEC:") + len("AGENT_SPEC:")
-                raw_json = full_response[idx:].strip()
-                brace = raw_json.find("{")
-                end = raw_json.rfind("}") + 1
-                if brace != -1 and end > brace:
-                    spec_dict = json.loads(raw_json[brace:end])
-                    async with db_session() as session:
-                        if body.agent_id:
-                            existing = await session.get(DbAgentSpec, uuid.UUID(body.agent_id))
-                            if existing:
-                                existing.name = spec_dict.get("name", existing.name)
-                                existing.system_prompt = spec_dict.get("system_prompt", existing.system_prompt)
-                                existing.allowed_tools = spec_dict.get("allowed_tools", existing.allowed_tools)
-                                existing.max_turns = spec_dict.get("max_turns", existing.max_turns)
-                                saved = existing
-                            else:
-                                saved = DbAgentSpec(
-                                    name=spec_dict.get("name", "New Agent"),
-                                    system_prompt=spec_dict.get("system_prompt", ""),
-                                    allowed_tools=spec_dict.get("allowed_tools", []),
-                                    allowed_mcp_servers={},
-                                    max_turns=spec_dict.get("max_turns", 20),
-                                )
-                                session.add(saved)
-                        else:
-                            saved = DbAgentSpec(
-                                name=spec_dict.get("name", "New Agent"),
-                                system_prompt=spec_dict.get("system_prompt", ""),
-                                allowed_tools=spec_dict.get("allowed_tools", []),
-                                allowed_mcp_servers={},
-                                max_turns=spec_dict.get("max_turns", 20),
-                            )
-                            session.add(saved)
-                        await session.flush()
-                        saved_id = str(saved.id)
 
-                    yield f"event: spec_saved\ndata: {json.dumps({**spec_dict, 'id': saved_id})}\n\n"
+class UpdateAgentRequest(BaseModel):
+    name: str | None = None
+    system_prompt: str | None = None
+    capabilities: list[str] | None = None
 
-        except Exception as exc:
-            yield f"event: error\ndata: {json.dumps({'detail': str(exc)})}\n\n"
 
-        yield "event: done\ndata: {}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+@app.patch("/agents/{agent_id}")
+async def update_agent(agent_id: str, body: UpdateAgentRequest):
+    from fastapi import HTTPException
+    from builder_agent import capabilities_to_tools
+    async with db_session() as session:
+        spec = await session.get(DbAgentSpec, uuid.UUID(agent_id))
+        if not spec:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        if body.name is not None:
+            spec.name = body.name
+        if body.system_prompt is not None:
+            spec.system_prompt = body.system_prompt
+        if body.capabilities is not None:
+            spec.allowed_tools = capabilities_to_tools(body.capabilities)
+        await session.flush()
+        return _spec_to_dict(spec)
