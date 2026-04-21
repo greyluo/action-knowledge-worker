@@ -34,9 +34,17 @@ async def run_agent(prompt: str) -> None:
 
     from claude_agent_sdk import query as sdk_query
 
+    from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock
+
     messages = []
     async for event in sdk_query(prompt=prompt, options=options):
         messages.append(event)
+        if isinstance(event, AssistantMessage):
+            for block in event.content:
+                if isinstance(block, TextBlock) and block.text:
+                    print(f"\n[agent] {block.text}")
+                elif isinstance(block, ToolUseBlock):
+                    print(f"  → {block.name}({block.input})")
 
     async with db_session() as session:
         await end_run(session, ctx, messages)
