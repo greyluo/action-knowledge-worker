@@ -51,6 +51,19 @@ class TypeMatchResult(BaseModel):
     reason: str
 
 
+def _strip_fences(raw: str) -> str:
+    """Strip markdown code fences the LLM occasionally wraps around JSON."""
+    s = raw.strip()
+    if s.startswith("```"):
+        s = s[3:]
+        if s.startswith("json"):
+            s = s[4:]
+        s = s.strip()
+        if s.endswith("```"):
+            s = s[:-3].strip()
+    return s
+
+
 EXTRACT_SYSTEM = """You extract named entities and relationships from tool output JSON.
 Return ONLY valid JSON matching this schema — no markdown, no explanation:
 {
@@ -88,7 +101,7 @@ Return the extraction JSON:"""
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = resp.content[0].text
-            return ExtractionResult.model_validate_json(raw)
+            return ExtractionResult.model_validate_json(_strip_fences(raw))
         except (ValidationError, json.JSONDecodeError, IndexError) as e:
             logger.warning("llm_extract parse failure attempt %d: %s | raw=%r", attempt, e, raw)
             if attempt == 1:
@@ -132,7 +145,7 @@ Classify this candidate:"""
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = resp.content[0].text
-            return TypeMatchResult.model_validate_json(raw)
+            return TypeMatchResult.model_validate_json(_strip_fences(raw))
         except (ValidationError, json.JSONDecodeError, IndexError) as e:
             logger.warning("llm_type_match parse failure attempt %d: %s | raw=%r", attempt, e, raw)
             if attempt == 1:
