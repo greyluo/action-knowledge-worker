@@ -193,32 +193,10 @@ async def test_full_write_then_read_path(seeded, smoke_run_id):
         assert task_entity is not None
 
     # --- Steps 2 & 3: write path (company data) then read ---
-    # We need to know the type IDs the judge will be asked to classify against.
-    # Strategy: first call lets the judge see the ontology, then we patch
-    # both extract and judge together for determinism.
-
-    # Fetch type IDs from the seeded ontology so judge mock can return them.
-    async with db_session() as session:
-        company_type = await session.scalar(
-            select(OntologyType).where(OntologyType.name == "Company")
-        )
-        person_type = await session.scalar(
-            select(OntologyType).where(OntologyType.name == "Person")
-        )
-        deal_type = await session.scalar(
-            select(OntologyType).where(OntologyType.name == "Deal")
-        )
-
-    # At this point, Company/Person/Deal may not exist yet (they're provisional,
-    # created on first encounter). We use side_effect sequences that handle both
-    # cases: first extract call → 4 entities (Company, Person, Person, Deal),
-    # each needing a judge call.
-
-    # Build mock sequences for the company data step.
-    # llm_extract is called once; llm_type_match is called once per entity (4 total).
-    # Since Company/Person/Deal don't exist yet the judge will get "NEW" back after
-    # the types are created.  We simplify by having the judge always return NEW on
-    # first encounter, then REUSE using the newly created id.
+    # Company/Person/Deal types may not exist yet (they're provisional, created on first
+    # encounter).  The judge always returns NEW for these types; _persist_type is
+    # idempotent so re-runs are safe.  llm_extract is called once; llm_type_match once
+    # per extracted entity (4 total for COMPANY_DATA["Acme Corp"]).
 
     company_extract_resp = _extract_company_response()
 
@@ -268,17 +246,8 @@ async def test_full_write_then_read_path(seeded, smoke_run_id):
                 f"Entity {eid} source_refs missing fetch_company_data: {e.source_refs}"
             )
 
-        # Newly created entities in this run should have run_id stamp; there must
-        # be at least one (even on re-run the first-ever run creates them).
-        stamped = (
-            await session.execute(
-                select(Entity).where(Entity.created_in_run_id == run_id)
-            )
-        ).scalars().all()
-        # We accept 0 stamped if all entities were merged from a prior run —
-        # but there must be at least source_ref evidence (checked above).
-        # The run entity itself always gets stamped.
-        # Stronger check: at least one OntologyEvent exists.
+        # Confirm at least one entity_created OntologyEvent was written (either in this
+        # run or a prior idempotent run — provenance evidence is present either way).
         events = (
             await session.execute(
                 select(OntologyEvent).where(OntologyEvent.event_type == "entity_created")
