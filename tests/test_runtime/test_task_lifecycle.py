@@ -1,4 +1,5 @@
 import uuid
+import datetime
 import pytest
 from sqlalchemy import select
 
@@ -45,11 +46,19 @@ async def test_new_task_has_in_service_of_edge(session):
     )
     assert edge is not None
 
+    # Verify the edge points FROM the Run entity TO the Task entity
+    run_entity = await session.scalar(
+        select(Entity).where(Entity.properties["run_id"].astext == str(ctx.run_id))
+    )
+    assert run_entity is not None, "Run entity should be created by begin_run"
+    assert edge.src_id == run_entity.id, "in_service_of edge should point FROM run entity TO task"
+
 
 async def test_task_resumed_by_keyword(session):
     """begin_run with a resumption keyword reuses the most recent in_progress Task."""
     spec, agent_entity_id = await _setup(session)
 
+    start_time = datetime.datetime.now(datetime.timezone.utc)
     first_ctx = await begin_run(session, "Start work on Acme deal", spec, agent_entity_id)
     original_task_id = first_ctx.task_id
 
@@ -57,13 +66,14 @@ async def test_task_resumed_by_keyword(session):
 
     assert resumed_ctx.task_id == original_task_id
 
+    # Count only Tasks created during this test to avoid shared-session interference
     task_type = await session.scalar(select(OntologyType).where(OntologyType.name == "Task"))
     tasks = (
         await session.execute(
-            select(Entity).where(Entity.type_id == task_type.id)
+            select(Entity).where(Entity.type_id == task_type.id, Entity.created_at >= start_time)
         )
     ).scalars().all()
-    assert len(tasks) == 1, "Resume must not create a duplicate Task entity"
+    assert len(tasks) == 1, "begin_run should not create a duplicate Task on resume"
 
 
 async def test_no_in_progress_task_to_resume(session):
