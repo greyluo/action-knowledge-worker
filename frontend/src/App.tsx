@@ -7,10 +7,9 @@ import { OntologyView } from './components/ontology/OntologyView'
 import { RunsView } from './components/runs/RunsView'
 import {
   getAgents, getAgentTasks, getTaskMessages,
-  getEntities, getEdges, getRuns,
+  getEntities, getEdges, getRuns, getRunEvents,
   streamChat,
 } from './api'
-import { EVENTS } from './mock/runs'
 import type { AgentSpec, Message, Task, Entity, Edge, Run, OntologyEvent } from './types'
 import './styles/tokens.css'
 import './App.css'
@@ -28,7 +27,7 @@ export default function App() {
   const [entities, setEntities] = useState<Entity[]>([])
   const [edges, setEdges] = useState<Edge[]>([])
   const [runs, setRuns] = useState<Run[]>([])
-  const [events] = useState<OntologyEvent[]>(EVENTS)
+  const [events, setEvents] = useState<OntologyEvent[]>([])
 
   const [builderState, setBuilderState] = useState<PanelState>('normal')
   const [spaceState, setSpaceState] = useState<PanelState>('normal')
@@ -43,7 +42,12 @@ export default function App() {
     }).catch(console.error)
     getEntities().then(setEntities).catch(console.error)
     getEdges().then(setEdges).catch(console.error)
-    getRuns().then(setRuns).catch(console.error)
+    getRuns().then((loadedRuns) => {
+      setRuns(loadedRuns)
+      Promise.all(loadedRuns.map((r) => getRunEvents(r.id)))
+        .then((allEvents) => setEvents(allEvents.flat()))
+        .catch(console.error)
+    }).catch(console.error)
   }, [])
 
   useEffect(() => {
@@ -120,7 +124,12 @@ export default function App() {
       },
       onDone: (_runId, taskId) => {
         getEntities().then(setEntities).catch(console.error)
-        getRuns().then(setRuns).catch(console.error)
+        getRuns().then((loadedRuns) => {
+          setRuns(loadedRuns)
+          Promise.all(loadedRuns.map((r) => getRunEvents(r.id)))
+            .then((allEvents) => setEvents(allEvents.flat()))
+            .catch(console.error)
+        }).catch(console.error)
         if (taskId) {
           setSelectedTaskIds((prev) => ({ ...prev, [selectedAgentId]: taskId }))
           getTaskMessages(taskId).then((loaded) => {
