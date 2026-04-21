@@ -124,6 +124,20 @@ async def _get_or_create_run_entity(
     return run_entity
 
 
+def _extract_text(msg) -> str:
+    """Pull plain text out of an SDK message object or fall back to str()."""
+    content = getattr(msg, "content", None)
+    if content and isinstance(content, list):
+        parts = []
+        for block in content:
+            t = getattr(block, "text", None)
+            if t:
+                parts.append(t)
+        if parts:
+            return "\n".join(parts)
+    return str(msg)
+
+
 async def end_run(session: AsyncSession, ctx: RunContext, messages: list) -> None:
     run = await session.get(Run, ctx.run_id)
     if run:
@@ -132,7 +146,8 @@ async def end_run(session: AsyncSession, ctx: RunContext, messages: list) -> Non
 
     outcome = None
     for msg in reversed(messages):
-        text = str(msg)
+        # Extract plain text from SDK message objects or plain strings
+        text = _extract_text(msg)
         if "OUTCOME_SUMMARY:" in text:
             idx = text.index("OUTCOME_SUMMARY:") + len("OUTCOME_SUMMARY:")
             outcome = text[idx:].strip()[:1000]

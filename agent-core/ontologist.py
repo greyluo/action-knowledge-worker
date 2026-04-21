@@ -19,13 +19,6 @@ anthropic_client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY
 EXTRACTION_MODEL = "claude-haiku-4-5-20251001"
 JUDGE_MODEL = "claude-haiku-4-5-20251001"
 
-# Canonical keys per type name — hardcoded narrowly to avoid edge cases
-CANONICAL_KEYS: dict[str, str | list[str]] = {
-    "Person": "email",
-    "Company": "domain",
-    "Deal": ["name", "company"],
-}
-
 
 class CandidateEntity(BaseModel):
     name: str
@@ -70,7 +63,7 @@ EXTRACT_SYSTEM = """You extract named entities and relationships from tool outpu
 Return ONLY valid JSON matching this schema — no markdown, no explanation:
 {
   "entities": [
-    {"name": "<display name>", "properties": {<all known props>}, "type_hint": "<Person|Company|Deal|Task|null>"}
+    {"name": "<display name>", "properties": {<all known props>}, "type_hint": "<Person|Company|Deal|null>"}
   ],
   "relationships": [
     {"src_idx": <int index into entities>, "dst_idx": <int index into entities>, "label": "<edge type name>"}
@@ -79,6 +72,7 @@ Return ONLY valid JSON matching this schema — no markdown, no explanation:
 Rules:
 - Extract every distinct named entity: people (with email if present), companies, deals/opportunities.
 - Do NOT extract generic values like dates, counts, or boolean flags as entities.
+- Do NOT extract system/infrastructure entities — never set type_hint to Task, Run, Agent, or Entity.
 - For relationships, only include pairs where both src and dst are in your entities list.
 - If no entities, return {"entities": [], "relationships": []}.
 """
@@ -116,8 +110,9 @@ JUDGE_SYSTEM = """You classify a candidate entity against an existing type syste
 Return ONLY valid JSON — no markdown, no explanation:
   {"decision": "REUSE", "type_id": "<uuid>", "reason": "..."}
   OR
-  {"decision": "NEW", "proposed": {"name": "...", "fields": {...}, "parent": "Entity", "description": "..."}, "reason": "..."}
+  {"decision": "NEW", "proposed": {"name": "...", "fields": {...}, "canonical_key": "<field_name or field1,field2 or null>", "parent": "Entity", "description": "..."}, "reason": "..."}
 
+canonical_key: the field (or comma-separated fields) that uniquely identifies an instance of this type (e.g. "email" for Person, "domain" for Company). Use null if no single field is a reliable unique identifier.
 Prefer REUSE if any existing type fits. Prefer extending an existing type's properties over creating a new type with near-identical shape.
 """
 
@@ -208,6 +203,33 @@ async def ontologist_step(
         return await _ontologist_step_inner(tool_name, tool_input, tool_output, run_ctx, session)
 
 
+async def _stamp_in_service_of(
+    session: AsyncSession, entity_id: uuid.UUID, run_ctx: RunContext
+) -> None:
+    if not run_ctx.task_id:
+        return
+    in_service_et = await session.scalar(
+        select(EdgeType).where(EdgeType.name == "in_service_of")
+    )
+    if not in_service_et:
+        return
+    exists = await session.scalar(
+        select(Edge).where(
+            Edge.src_id == entity_id,
+            Edge.dst_id == run_ctx.task_id,
+            Edge.edge_type_id == in_service_et.id,
+        )
+    )
+    if not exists:
+        session.add(Edge(
+            src_id=entity_id,
+            dst_id=run_ctx.task_id,
+            edge_type_id=in_service_et.id,
+            created_by_agent_id=run_ctx.agent_entity_id,
+            created_in_run_id=run_ctx.run_id,
+        ))
+
+
 async def _ontologist_step_inner(
     tool_name: str,
     tool_input: dict,
@@ -221,10 +243,15 @@ async def _ontologist_step_inner(
     if not extraction.entities:
         return []
 
+    _SYSTEM_TYPE_NAMES = {"Task", "Run", "Agent", "Entity"}
+
     existing_types = await _get_all_types(session)
     resolved_ids: list[uuid.UUID] = []
 
     for cand in extraction.entities:
+        if cand.type_hint in _SYSTEM_TYPE_NAMES:
+            logger.debug("Skipping candidate %r with system type_hint %r", cand.name, cand.type_hint)
+            continue
         match = await llm_type_match(cand, existing_types)
 
         if match.decision == "REUSE" and match.type_id:
@@ -234,15 +261,21 @@ async def _ontologist_step_inner(
             existing_types = await _get_all_types(session)
 
         canonical = _get_canonical_key(existing_types, type_id)
+        existing = None
         if canonical:
             existing = await _find_by_canonical(session, type_id, canonical, cand.properties)
-            if existing:
-                existing.properties = {**existing.properties, **cand.properties}
-                existing.source_refs = existing.source_refs + [
-                    {"tool": tool_name, "input": str(tool_input)[:200]}
-                ]
-                resolved_ids.append(existing.id)
-                continue
+        # Fallback: if canonical key didn't match (e.g. email changed), try name.
+        # This merges "Alice Chen" when her email is updated rather than creating a duplicate.
+        if existing is None and cand.properties.get("name"):
+            existing = await _find_by_name(session, type_id, cand.properties["name"])
+        if existing:
+            existing.properties = {**existing.properties, **cand.properties}
+            existing.source_refs = existing.source_refs + [
+                {"tool": tool_name, "input": str(tool_input)[:200]}
+            ]
+            resolved_ids.append(existing.id)
+            await _stamp_in_service_of(session, existing.id, run_ctx)
+            continue
 
         entity = Entity(
             type_id=type_id,
@@ -262,30 +295,29 @@ async def _ontologist_step_inner(
             payload={"type_id": str(type_id), "name": cand.name},
         ))
 
-        if run_ctx.task_id:
-            in_service_et = await session.scalar(
-                select(EdgeType).where(EdgeType.name == "in_service_of")
-            )
-            if in_service_et:
-                session.add(Edge(
-                    src_id=entity.id,
-                    dst_id=run_ctx.task_id,
-                    edge_type_id=in_service_et.id,
-                    created_by_agent_id=run_ctx.agent_entity_id,
-                    created_in_run_id=run_ctx.run_id,
-                ))
+        await _stamp_in_service_of(session, entity.id, run_ctx)
 
     for rel in extraction.relationships:
         if rel.src_idx < len(resolved_ids) and rel.dst_idx < len(resolved_ids):
             et = await _resolve_edge_type(session, rel.label, run_ctx)
             if et:
-                session.add(Edge(
-                    src_id=resolved_ids[rel.src_idx],
-                    dst_id=resolved_ids[rel.dst_idx],
-                    edge_type_id=et,
-                    created_by_agent_id=run_ctx.agent_entity_id,
-                    created_in_run_id=run_ctx.run_id,
-                ))
+                src_id = resolved_ids[rel.src_idx]
+                dst_id = resolved_ids[rel.dst_idx]
+                exists = await session.scalar(
+                    select(Edge).where(
+                        Edge.src_id == src_id,
+                        Edge.dst_id == dst_id,
+                        Edge.edge_type_id == et,
+                    )
+                )
+                if not exists:
+                    session.add(Edge(
+                        src_id=src_id,
+                        dst_id=dst_id,
+                        edge_type_id=et,
+                        created_by_agent_id=run_ctx.agent_entity_id,
+                        created_in_run_id=run_ctx.run_id,
+                    ))
 
     return resolved_ids
 
@@ -298,7 +330,16 @@ async def _get_ontology_summary(session: AsyncSession) -> str:
 
 async def _get_all_types(session: AsyncSession) -> list[dict]:
     types = (await session.execute(select(OntologyType))).scalars().all()
-    return [{"id": str(t.id), "name": t.name, "fields": t.fields, "description": t.description} for t in types]
+    return [
+        {
+            "id": str(t.id),
+            "name": t.name,
+            "fields": t.fields,
+            "canonical_key": t.canonical_key,
+            "description": t.description,
+        }
+        for t in types
+    ]
 
 
 async def _persist_type(session: AsyncSession, proposed: dict, run_ctx: RunContext) -> uuid.UUID:
@@ -310,6 +351,7 @@ async def _persist_type(session: AsyncSession, proposed: dict, run_ctx: RunConte
         name=name,
         parent_name=proposed.get("parent", "Entity"),
         fields=proposed.get("fields", {}),
+        canonical_key=proposed.get("canonical_key"),
         description=proposed.get("description", ""),
         status="provisional",
     )
@@ -326,7 +368,12 @@ async def _persist_type(session: AsyncSession, proposed: dict, run_ctx: RunConte
 def _get_canonical_key(types: list[dict], type_id: uuid.UUID) -> str | list[str] | None:
     for t in types:
         if t["id"] == str(type_id):
-            return CANONICAL_KEYS.get(t["name"])
+            ck = t.get("canonical_key")
+            if not ck:
+                return None
+            # Support comma-separated composite keys stored as a single string
+            parts = [p.strip() for p in ck.split(",") if p.strip()]
+            return parts if len(parts) > 1 else parts[0]
     return None
 
 
@@ -351,6 +398,17 @@ async def _find_by_canonical(
             return None
         query = query.where(Entity.properties[f].astext == str(val))
     return await session.scalar(query)
+
+
+async def _find_by_name(
+    session: AsyncSession, type_id: uuid.UUID, name: str
+) -> Entity | None:
+    return await session.scalar(
+        select(Entity).where(
+            Entity.type_id == type_id,
+            Entity.properties["name"].astext == name,
+        )
+    )
 
 
 async def _resolve_edge_type(

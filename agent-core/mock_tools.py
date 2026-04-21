@@ -142,6 +142,20 @@ async def fetch_email_thread(args: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool(
+    "remember_entity",
+    (
+        "Persist a fact about a person, company, or deal to the knowledge graph. "
+        "Call this when the user provides information that should be remembered "
+        "(e.g. a name change, a new contact, an updated deal status)."
+    ),
+    {"name": str, "type_hint": str, "properties": dict},
+    annotations=ToolAnnotations(readOnlyHint=False),
+)
+async def remember_entity(args: dict[str, Any]) -> dict[str, Any]:
+    return {"content": [{"type": "text", "text": json.dumps(args)}]}
+
+
+@tool(
     "query_graph",
     (
         "Query the knowledge graph for typed entities and their relationships. "
@@ -182,5 +196,5 @@ async def query_graph_tool(args: dict[str, Any]) -> dict[str, Any]:
 demo_server = create_sdk_mcp_server(
     name="demo",
     version="1.0.0",
-    tools=[fetch_company_data, fetch_email_thread, query_graph_tool],
+    tools=[fetch_company_data, fetch_email_thread, remember_entity, query_graph_tool],
 )

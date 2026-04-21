@@ -89,6 +89,7 @@ class OntologyType(Base):
     name: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     parent_name: Mapped[str | None] = mapped_column(String, nullable=True)
     fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    canonical_key: Mapped[str | None] = mapped_column(String, nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="provisional")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

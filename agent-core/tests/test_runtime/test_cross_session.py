@@ -135,15 +135,28 @@ async def seeded():
             )
 
         extra_type_names = ("Person", "Company", "Deal")
-        await session.execute(
-            delete(OntologyType)
-            .where(OntologyType.name.in_(extra_type_names))
-            .where(OntologyType.status == "provisional")
-        )
+        used_type_ids = {
+            r
+            for (r,) in (
+                await session.execute(select(Entity.type_id))
+            ).all()
+        }
+        prov_types = (
+            await session.execute(
+                select(OntologyType)
+                .where(OntologyType.name.in_(extra_type_names))
+                .where(OntologyType.status == "provisional")
+            )
+        ).scalars().all()
+        for ot in prov_types:
+            if ot.id not in used_type_ids:
+                await session.delete(ot)
 
         actor = f"agent:{agent_entity_id}"
         await session.execute(
-            delete(OntologyEvent).where(OntologyEvent.actor == actor)
+            delete(OntologyEvent)
+            .where(OntologyEvent.actor == actor)
+            .where(OntologyEvent.created_at >= cleanup_after)
         )
 
         if run_ids:

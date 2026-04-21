@@ -293,10 +293,11 @@ async def dump_task(task_id: uuid.UUID) -> None:
         # All entity IDs in this subgraph (task + all service entities)
         subgraph_ids = {task_id} | {e.id for e in service_entities}
 
-        # Load all edges among the subgraph entities
+        # Load all edges among the subgraph entities; deduplicate by
+        # (src_id, dst_id, edge_type_id) to suppress pre-fix duplicates in DB.
         subgraph_edges: list[Edge] = []
         if subgraph_ids:
-            subgraph_edges = list(
+            raw_edges = list(
                 (
                     await session.execute(
                         select(Edge).where(
@@ -308,6 +309,12 @@ async def dump_task(task_id: uuid.UUID) -> None:
                 .scalars()
                 .all()
             )
+            seen_edges: set[tuple] = set()
+            for edge in raw_edges:
+                key = (edge.src_id, edge.dst_id, edge.edge_type_id)
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    subgraph_edges.append(edge)
 
         # Map entity_id -> run_id for display
         run_id_by_entity: dict[uuid.UUID, uuid.UUID | None] = {
