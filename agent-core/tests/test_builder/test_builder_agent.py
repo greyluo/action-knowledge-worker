@@ -1,3 +1,6 @@
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 from builder_agent import capabilities_to_tools, tools_to_capabilities
 
@@ -39,9 +42,6 @@ def test_roundtrip():
     tools = capabilities_to_tools(caps_in)
     caps_out = tools_to_capabilities(tools)
     assert set(caps_out) == set(caps_in)
-
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
 
 def test_generate_spec_returns_parsed_dict():
     mock_text = '{"name": "Web Scout", "system_prompt": "You search the web.", "capabilities": ["web_research"]}'
