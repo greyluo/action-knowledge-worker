@@ -53,14 +53,16 @@ class TypeMatchResult(BaseModel):
 
 def _strip_fences(raw: str) -> str:
     """Strip markdown code fences the LLM occasionally wraps around JSON."""
+    import re
     s = raw.strip()
     if s.startswith("```"):
+        m = re.search(r"^```(?:json)?\s*(.*?)```", s, re.DOTALL)
+        if m:
+            return m.group(1).strip()
         s = s[3:]
         if s.startswith("json"):
             s = s[4:]
-        s = s.strip()
-        if s.endswith("```"):
-            s = s[:-3].strip()
+        return s.strip()
     return s
 
 
