@@ -1,6 +1,6 @@
-import type { AgentSpec, Entity, Edge, Run, OntologyEvent, Task, Message } from './types'
+import type { AgentSpec, Entity, Edge, Run, OntologyEvent, Task, Message, EntityType, EdgeType } from './types'
 
-const BASE = 'http://localhost:8000'
+const BASE = 'http://localhost:8001'
 
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`)
@@ -16,6 +16,8 @@ export const getEntities = (type?: string): Promise<Entity[]> =>
 export const getEdges = (): Promise<Edge[]> => get('/edges')
 export const getRuns = (): Promise<Run[]> => get('/runs')
 export const getRunEvents = (runId: string): Promise<OntologyEvent[]> => get(`/runs/${runId}/events`)
+export const getEntityTypes = (): Promise<EntityType[]> => get('/schema/entity-types')
+export const getEdgeTypes = (): Promise<EdgeType[]> => get('/schema/edge-types')
 
 export interface ChatCallbacks {
   onToolCall?: (tool: string, args: Record<string, unknown>) => void
@@ -49,36 +51,45 @@ export function streamChat(
   return () => controller.abort()
 }
 
-export interface BuilderCallbacks {
-  onToken?: (text: string) => void
-  onSpecSaved?: (spec: AgentSpec) => void
-  onDone?: () => void
-  onError?: (detail: string) => void
-}
-
-export function streamBuilderChat(
-  message: string,
-  history: Array<{ role: string; content: string }>,
-  agentId: string | null,
-  callbacks: BuilderCallbacks,
-): () => void {
-  const controller = new AbortController()
-
-  fetch(`${BASE}/builder/chat`, {
+export async function generateAgentSpec(description: string): Promise<{
+  name: string
+  system_prompt: string
+  capabilities: string[]
+}> {
+  const res = await fetch(`${BASE}/builder/generate`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, history, agent_id: agentId }),
-    signal: controller.signal,
+    body: JSON.stringify({ description }),
   })
-    .then((res) => parseSseStream(res, (type, data) => {
-      if (type === 'token') callbacks.onToken?.(data.text as string)
-      else if (type === 'spec_saved') callbacks.onSpecSaved?.(data as unknown as AgentSpec)
-      else if (type === 'done') callbacks.onDone?.()
-      else if (type === 'error') callbacks.onError?.(data.detail as string)
-    }))
-    .catch((err) => { if (err.name !== 'AbortError') callbacks.onError?.(String(err)) })
+  if (!res.ok) throw new Error(`Generate failed: ${res.status}`)
+  return res.json()
+}
 
-  return () => controller.abort()
+export async function createAgent(
+  name: string,
+  system_prompt: string,
+  capabilities: string[],
+): Promise<AgentSpec> {
+  const res = await fetch(`${BASE}/agents`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, system_prompt, capabilities }),
+  })
+  if (!res.ok) throw new Error(`Create agent failed: ${res.status}`)
+  return res.json()
+}
+
+export async function updateAgent(
+  id: string,
+  patch: { name?: string; system_prompt?: string; capabilities?: string[] },
+): Promise<AgentSpec> {
+  const res = await fetch(`${BASE}/agents/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+  })
+  if (!res.ok) throw new Error(`Update agent failed: ${res.status}`)
+  return res.json()
 }
 
 async function parseSseStream(
