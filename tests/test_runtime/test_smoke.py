@@ -318,7 +318,7 @@ async def test_full_write_then_read_path(seeded, smoke_run_id):
     async with db_session() as session:
         # Reload spec (session-scoped objects can't be reused across sessions)
         spec = await session.get(AgentSpec, spec_id)
-        await end_run(session, ctx, messages=[])
+        await end_run(session, ctx, messages=["OUTCOME_SUMMARY: Smoke test completed."])
 
     async with db_session() as session:
         run = await session.get(Run, run_id)
@@ -326,6 +326,6 @@ async def test_full_write_then_read_path(seeded, smoke_run_id):
         task = await session.get(Entity, task_id)
         assert task is not None
         task_status = task.properties.get("status")
-        assert task_status in ("completed", "in_progress"), (
+        assert task_status == "completed", (
             f"Task status unexpected: {task_status!r}"
         )
