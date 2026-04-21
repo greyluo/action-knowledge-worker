@@ -122,6 +122,7 @@ export default function App() {
         getEntities().then(setEntities).catch(console.error)
         getRuns().then(setRuns).catch(console.error)
         if (taskId) {
+          setSelectedTaskIds((prev) => ({ ...prev, [selectedAgentId]: taskId }))
           getTaskMessages(taskId).then((loaded) => {
             setMessages((prev) => ({ ...prev, [taskId]: loaded }))
           }).catch(console.error)

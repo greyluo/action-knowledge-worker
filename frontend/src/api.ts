@@ -85,6 +85,11 @@ async function parseSseStream(
   res: Response,
   onEvent: (type: string, data: Record<string, unknown>) => void,
 ): Promise<void> {
+  if (!res.ok) {
+    const text = await res.text()
+    onEvent('error', { detail: `HTTP ${res.status}: ${text}` })
+    return
+  }
   const reader = res.body!.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
