@@ -63,7 +63,7 @@ async def get_transitive_closure(
             FROM edges
             WHERE edge_type_id = :edge_type_id AND src_id = :from_id
             UNION ALL
-            SELECT e.src_id, e.dst_id, c.depth + 1
+            SELECT c.src_id, e.dst_id, c.depth + 1
             FROM edges e
             JOIN closure c ON e.src_id = c.dst_id
             WHERE e.edge_type_id = :edge_type_id AND c.depth < :max_hops
