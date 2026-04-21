@@ -11,7 +11,7 @@ TEST_DATABASE_URL = os.getenv(
     "postgresql+asyncpg://grey@localhost:5432/sprint_demo_test",
 )
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture(loop_scope="session")
 async def test_engine():
     from db import Base
     engine = create_async_engine(TEST_DATABASE_URL, echo=False)

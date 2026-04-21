@@ -21,8 +21,8 @@ def upgrade() -> None:
         sa.Column("system_prompt", sa.Text(), nullable=False),
         sa.Column("allowed_tools", postgresql.JSONB(), nullable=False, server_default="[]"),
         sa.Column("allowed_mcp_servers", postgresql.JSONB(), nullable=False, server_default="{}"),
-        sa.Column("max_turns", sa.Integer(), default=20),
-        sa.Column("version", sa.Integer(), default=1),
+        sa.Column("max_turns", sa.Integer(), server_default=sa.text("20")),
+        sa.Column("version", sa.Integer(), server_default=sa.text("1")),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
     op.create_table(
