@@ -111,6 +111,10 @@ SEED_ENTITY_TYPES = [
         "status": "str",
         "outcome_summary": "str",
     }, "canonical_key": None, "description": "A unit of work persisting across sessions"},
+    {"name": "Handoff", "parent_name": "Entity", "fields": {
+        "from_agent": "str", "to_agent": "str",
+        "summary": "str", "key_entity_ids": "list",
+    }, "canonical_key": None, "description": "Cover note passed between agents at delegation time"},
 ]
 
 SEED_EDGE_TYPES = [
@@ -126,6 +130,14 @@ SEED_EDGE_TYPES = [
     {"name": "owned_by", "is_transitive": False, "is_inverse_of": "owns"},
     {"name": "assigned_to", "is_transitive": False, "is_inverse_of": "has_assignee"},
     {"name": "has_assignee", "is_transitive": False, "is_inverse_of": "assigned_to"},
+    # Multi-agent topology edges
+    {"name": "delegates_to", "is_transitive": False, "is_inverse_of": "reports_to"},
+    {"name": "next_in_chain", "is_transitive": False, "is_inverse_of": None},
+    {"name": "parallel_with", "is_transitive": False, "is_inverse_of": None},
+    {"name": "loops_back_to", "is_transitive": False, "is_inverse_of": None},
+    {"name": "handles", "is_transitive": False, "is_inverse_of": None},
+    {"name": "fallback_to", "is_transitive": False, "is_inverse_of": None},
+    {"name": "seeded_with", "is_transitive": False, "is_inverse_of": None},
 ]
 
 
