@@ -131,7 +131,7 @@ SEED_EDGE_TYPES = [
     {"name": "assigned_to", "is_transitive": False, "is_inverse_of": "has_assignee"},
     {"name": "has_assignee", "is_transitive": False, "is_inverse_of": "assigned_to"},
     # Multi-agent topology edges
-    {"name": "delegates_to", "is_transitive": False, "is_inverse_of": "reports_to"},
+    {"name": "delegates_to", "is_transitive": False, "is_inverse_of": None},
     {"name": "next_in_chain", "is_transitive": False, "is_inverse_of": None},
     {"name": "parallel_with", "is_transitive": False, "is_inverse_of": None},
     {"name": "loops_back_to", "is_transitive": False, "is_inverse_of": None},
