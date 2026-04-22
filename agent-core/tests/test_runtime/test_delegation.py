@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from db import AgentSpec, EdgeType, OntologyType, Run
 from seed import run_seed
-from spec_factory import RunContext, begin_run, get_agent_entity_id, load_spec
+from spec_factory import RunContext, begin_run, get_agent_entity_id
 
 
 async def test_topology_edge_types_seeded(session):
