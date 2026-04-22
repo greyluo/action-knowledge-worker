@@ -194,7 +194,7 @@ _ONTOLOGY_TOOLS = frozenset({
 })
 
 # Tool outputs from these are not external data — skip ontology extraction
-_SKIP_COLLECTION = frozenset({"mcp__demo__query_graph"})
+_SKIP_COLLECTION = frozenset({"mcp__demo__query_graph", "mcp__demo__delegate_task"})
 
 
 def build_options_from_spec(
@@ -212,7 +212,8 @@ def build_options_from_spec(
     - PostToolUse: collects external tool outputs (skips query_graph)
     - Stop: batch-runs the ontologist over all collected outputs
     """
-    from mock_tools import demo_server
+    from mock_tools import make_demo_server
+    demo_server = make_demo_server(run_ctx)
     from ontologist import ontologist_step
     from seed import SYSTEM_PROMPT as _BASE_PROMPT
     from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
