@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -33,9 +34,18 @@ class CandidateRelationship(BaseModel):
     label: str
 
 
+class CandidateRelationshipChange(BaseModel):
+    src_idx: int
+    dst_idx: int
+    old_label: str
+    new_label: str
+
+
 class ExtractionResult(BaseModel):
     entities: list[CandidateEntity]
     relationships: list[CandidateRelationship]
+    removed_relationships: list[CandidateRelationship] = []
+    modified_relationships: list[CandidateRelationshipChange] = []
 
 
 class TypeMatchResult(BaseModel):
@@ -50,7 +60,9 @@ class OntologyStepResult:
     entity_ids: list[uuid.UUID] = field(default_factory=list)
     changes: list[dict] = field(default_factory=list)   # {action, type_name, name, id}
     new_types: list[str] = field(default_factory=list)
-    new_edges: list[dict] = field(default_factory=list)  # {src, label, dst}
+    new_edges: list[dict] = field(default_factory=list)         # {src, label, dst}
+    removed_edges: list[dict] = field(default_factory=list)     # {src, label, dst}
+    modified_edges: list[dict] = field(default_factory=list)    # {src, old_label, new_label, dst}
 
     def to_context(self) -> str:
         if not self.entity_ids:
@@ -63,6 +75,10 @@ class OntologyStepResult:
             parts.append(f"NEW_TYPE {t} (provisional)")
         for e in self.new_edges:
             parts.append(f'EDGE "{e["src"]}" --{e["label"]}--> "{e["dst"]}"')
+        for e in self.removed_edges:
+            parts.append(f'REMOVED_EDGE "{e["src"]}" --{e["label"]}--> "{e["dst"]}"')
+        for e in self.modified_edges:
+            parts.append(f'MODIFIED_EDGE "{e["src"]}" --{e["old_label"]}-->{e["new_label"]}--> "{e["dst"]}"')
         return "; ".join(parts)
 
 
@@ -89,6 +105,12 @@ Return ONLY valid JSON matching this schema — no markdown, no explanation:
   ],
   "relationships": [
     {"src_idx": <int index into entities>, "dst_idx": <int index into entities>, "label": "<edge type name>"}
+  ],
+  "removed_relationships": [
+    {"src_idx": <int>, "dst_idx": <int>, "label": "<edge type that no longer applies>"}
+  ],
+  "modified_relationships": [
+    {"src_idx": <int>, "dst_idx": <int>, "old_label": "<current edge type>", "new_label": "<replacement edge type>"}
   ]
 }
 Rules:
@@ -97,9 +119,20 @@ Rules:
 - Use type_hint to suggest the most specific type that fits (e.g. "Person", "Company", "Product", "Location"). Use null if uncertain.
 - Do NOT extract generic values like counts, boolean flags, or raw dates as entities.
 - Do NOT extract system/infrastructure entities — never set type_hint to Task, Run, Agent, or Entity.
-- For relationships, only include pairs where both src and dst are in your entities list.
+- Do NOT extract tool names or API identifiers as entities (e.g. strings like "mcp__demo__query_graph" or anything matching the pattern mcp__*__*).
+- For all relationship lists, only include pairs where both src and dst are in your entities list.
 - For relationship labels, reuse an existing label from the ontology context when it fits. Only invent a new label if no existing one is semantically correct.
-- If no entities, return {"entities": [], "relationships": []}.
+
+Relationship operation rules:
+- relationships: edges that currently hold and should be created if absent.
+- removed_relationships: edges that no longer apply because of a state change in the data.
+  Example: book.status changes to "available" → remove the "borrows" edge from Person to Book.
+  When you detect a dissolution, extract BOTH related entities so their indices are available.
+- modified_relationships: edges where the relationship type should evolve rather than be dropped.
+  Example: "borrows" → "has_read" preserves the Person→Book link but changes its meaning after return.
+  Use modify (not remove+add) when the connection still makes semantic sense in a new form.
+
+- If no entities, return {"entities": [], "relationships": [], "removed_relationships": [], "modified_relationships": []}.
 """
 
 
@@ -321,34 +354,11 @@ async def ontologist_step(
         return await _ontologist_step_inner(tool_name, tool_input, tool_output, run_ctx, session)
 
 
-async def _stamp_in_service_of(
-    session: AsyncSession, entity_id: uuid.UUID, run_ctx: RunContext
-) -> None:
-    if not run_ctx.task_id:
-        return
-    in_service_et = await session.scalar(
-        select(EdgeType).where(EdgeType.name == "in_service_of")
-    )
-    if not in_service_et:
-        return
-    exists = await session.scalar(
-        select(Edge).where(
-            Edge.src_id == entity_id,
-            Edge.dst_id == run_ctx.task_id,
-            Edge.edge_type_id == in_service_et.id,
-        )
-    )
-    if not exists:
-        session.add(Edge(
-            src_id=entity_id,
-            dst_id=run_ctx.task_id,
-            edge_type_id=in_service_et.id,
-            created_by_agent_id=run_ctx.agent_entity_id,
-            created_in_run_id=run_ctx.run_id,
-        ))
-
 
 _REMEMBER_ENTITY_TOOLS = {"remember_entity", "mcp__demo__remember_entity"}
+_SKIP_TOOLS = {"query_graph", "mcp__demo__query_graph"}
+
+_TOOL_NAME_RE = re.compile(r"^mcp__\w+__\w+$")
 
 
 async def _ontologist_step_inner(
@@ -358,6 +368,9 @@ async def _ontologist_step_inner(
     run_ctx: RunContext,
     session: AsyncSession,
 ) -> OntologyStepResult:
+    if tool_name in _SKIP_TOOLS:
+        return OntologyStepResult()
+
     ontology_summary = await _get_ontology_summary(session)
 
     if tool_name in _REMEMBER_ENTITY_TOOLS:
@@ -398,6 +411,9 @@ async def _ontologist_step_inner(
     for cand in extraction.entities:
         if cand.type_hint in _SYSTEM_TYPE_NAMES:
             logger.debug("Skipping candidate %r with system type_hint %r", cand.name, cand.type_hint)
+            continue
+        if _TOOL_NAME_RE.match(cand.name):
+            logger.debug("Skipping candidate %r — looks like a tool name", cand.name)
             continue
         match = await llm_type_match(cand, existing_types)
 
@@ -443,7 +459,6 @@ async def _ontologist_step_inner(
             resolved_ids.append(existing.id)
             resolved_names[existing.id] = cand.name
             result.changes.append({"action": "updated", "type_name": type_name, "name": cand.name, "id": existing.id})
-            await _stamp_in_service_of(session, existing.id, run_ctx)
             continue
 
         entity = Entity(
@@ -466,7 +481,6 @@ async def _ontologist_step_inner(
             payload={"type_id": str(type_id), "name": cand.name},
         ))
 
-        await _stamp_in_service_of(session, entity.id, run_ctx)
 
     type_id_to_name = {t["id"]: t["name"] for t in existing_types}
 
@@ -524,6 +538,60 @@ async def _ontologist_step_inner(
                     src_name = resolved_names.get(src_id, str(src_id)[:8])
                     dst_name = resolved_names.get(dst_id, str(dst_id)[:8])
                     result.new_edges.append({"src": src_name, "label": rel.label, "dst": dst_name})
+
+    for rel in extraction.removed_relationships:
+        if rel.src_idx < len(resolved_ids) and rel.dst_idx < len(resolved_ids):
+            src_id = resolved_ids[rel.src_idx]
+            dst_id = resolved_ids[rel.dst_idx]
+            et = await session.scalar(select(EdgeType).where(EdgeType.name == rel.label))
+            if et:
+                edge = await session.scalar(
+                    select(Edge).where(
+                        Edge.src_id == src_id,
+                        Edge.dst_id == dst_id,
+                        Edge.edge_type_id == et.id,
+                    )
+                )
+                if edge:
+                    await session.delete(edge)
+                    src_name = resolved_names.get(src_id, str(src_id)[:8])
+                    dst_name = resolved_names.get(dst_id, str(dst_id)[:8])
+                    result.removed_edges.append({"src": src_name, "label": rel.label, "dst": dst_name})
+                    session.add(OntologyEvent(
+                        event_type="edge_removed",
+                        actor=f"agent:{run_ctx.agent_entity_id}",
+                        entity_id=src_id,
+                        payload={"label": rel.label, "dst_id": str(dst_id)},
+                    ))
+
+    for rel in extraction.modified_relationships:
+        if rel.src_idx < len(resolved_ids) and rel.dst_idx < len(resolved_ids):
+            src_id = resolved_ids[rel.src_idx]
+            dst_id = resolved_ids[rel.dst_idx]
+            old_et = await session.scalar(select(EdgeType).where(EdgeType.name == rel.old_label))
+            new_et = await _resolve_edge_type(session, rel.new_label, run_ctx, existing_types)
+            if old_et and new_et:
+                edge = await session.scalar(
+                    select(Edge).where(
+                        Edge.src_id == src_id,
+                        Edge.dst_id == dst_id,
+                        Edge.edge_type_id == old_et.id,
+                    )
+                )
+                if edge:
+                    edge.edge_type_id = new_et.id
+                    src_name = resolved_names.get(src_id, str(src_id)[:8])
+                    dst_name = resolved_names.get(dst_id, str(dst_id)[:8])
+                    result.modified_edges.append({
+                        "src": src_name, "old_label": rel.old_label,
+                        "new_label": rel.new_label, "dst": dst_name,
+                    })
+                    session.add(OntologyEvent(
+                        event_type="edge_modified",
+                        actor=f"agent:{run_ctx.agent_entity_id}",
+                        entity_id=src_id,
+                        payload={"old_label": rel.old_label, "new_label": rel.new_label, "dst_id": str(dst_id)},
+                    ))
 
     return result
 

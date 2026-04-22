@@ -1,6 +1,8 @@
 import { useMemo, useRef, useState, useEffect, useCallback } from 'react'
 import { forceSimulation, forceManyBody, forceLink, forceCollide, forceCenter } from 'd3-force'
 import type { SimulationNodeDatum, SimulationLinkDatum } from 'd3-force'
+import * as THREE from 'three'
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import type { Entity, Edge, EntityType, EdgeType, Run } from '../../types'
 import {
   createEntity, updateEntityProps, deleteEntity,
@@ -41,10 +43,10 @@ const btnBase: React.CSSProperties = {
   color: 'var(--color-text-muted)', lineHeight: 1.5,
 }
 const btnDanger: React.CSSProperties = {
-  ...btnBase, color: '#EF4444', borderColor: '#FCA5A5', background: '#FFF5F5',
+  ...btnBase, color: '#EF4444', border: '1px solid #FCA5A5', background: '#FFF5F5',
 }
 const btnPrimary: React.CSSProperties = {
-  ...btnBase, color: 'var(--color-accent)', borderColor: 'var(--color-accent)',
+  ...btnBase, color: 'var(--color-accent)', border: '1px solid var(--color-accent)',
   background: 'color-mix(in srgb, var(--color-accent) 8%, transparent)',
 }
 const inputStyle: React.CSSProperties = {
@@ -67,21 +69,32 @@ type SimLink = SimulationLinkDatum<SimNode>
 function resolveOverlaps(nodes: NodeState[], width: number, height: number): void {
   const minDist = NODE_RADIUS * 2 + NODE_GAP
   const pad = NODE_RADIUS + 8
-  for (let iter = 0; iter < 20; iter++) {
+  for (let iter = 0; iter < 60; iter++) {
     let moved = false
     for (let i = 0; i < nodes.length; i++) {
       for (let j = i + 1; j < nodes.length; j++) {
         const dx = nodes[j].x - nodes[i].x
         const dy = nodes[j].y - nodes[i].y
-        const dist = Math.sqrt(dx * dx + dy * dy) || 0.01
+        const dist = Math.sqrt(dx * dx + dy * dy)
         if (dist < minDist) {
-          const push = (minDist - dist) / 2 + 0.5
-          const nx = (dx / dist) * push; const ny = (dy / dist) * push
-          nodes[i].x = Math.max(pad, Math.min(width - pad, nodes[i].x - nx))
-          nodes[i].y = Math.max(pad, Math.min(height - pad, nodes[i].y - ny))
-          nodes[j].x = Math.max(pad, Math.min(width - pad, nodes[j].x + nx))
-          nodes[j].y = Math.max(pad, Math.min(height - pad, nodes[j].y + ny))
-          moved = true
+          // When nodes are exactly coincident (dist ≈ 0), dx/dy are both zero so the
+          // unit vector is (0,0) and the push goes nowhere. Use a golden-angle spread
+          // keyed on i so each coincident pair gets a unique separation direction.
+          let ux: number, uy: number
+          if (dist < 0.001) {
+            const angle = i * 2.39996  // golden angle in radians
+            ux = Math.cos(angle); uy = Math.sin(angle)
+          } else {
+            ux = dx / dist; uy = dy / dist
+          }
+          const push = (minDist - dist) / 2 + 1
+          const ix0 = nodes[i].x, iy0 = nodes[i].y
+          const jx0 = nodes[j].x, jy0 = nodes[j].y
+          nodes[i].x = Math.max(pad, Math.min(width - pad, nodes[i].x - ux * push))
+          nodes[i].y = Math.max(pad, Math.min(height - pad, nodes[i].y - uy * push))
+          nodes[j].x = Math.max(pad, Math.min(width - pad, nodes[j].x + ux * push))
+          nodes[j].y = Math.max(pad, Math.min(height - pad, nodes[j].y + uy * push))
+          if (nodes[i].x !== ix0 || nodes[i].y !== iy0 || nodes[j].x !== jx0 || nodes[j].y !== jy0) moved = true
         }
       }
     }
@@ -121,6 +134,49 @@ function runForce(nodes: NodeState[], edgeList: Array<{ src: string; dst: string
   return result
 }
 
+// Like runForce but pins existing nodes in place — only free nodes move.
+type PinnableSimNode = SimNode & { fx?: number | null; fy?: number | null }
+
+function runForcePartial(
+  nodes: NodeState[],
+  edgeList: Array<{ src: string; dst: string }>,
+  width: number,
+  height: number,
+  freeNodeIds: Set<string>,
+): NodeState[] {
+  if (nodes.length === 0) return []
+
+  const simNodes: PinnableSimNode[] = nodes.map((n) => ({
+    ...n,
+    fx: freeNodeIds.has(n.id) ? null : n.x,
+    fy: freeNodeIds.has(n.id) ? null : n.y,
+  }))
+  const nodeById = new Map(simNodes.map((n) => [n.id, n]))
+
+  const links: SimLink[] = edgeList
+    .filter((e) => nodeById.has(e.src) && nodeById.has(e.dst))
+    .map((e) => ({ source: nodeById.get(e.src)! as SimNode, target: nodeById.get(e.dst)! as SimNode }))
+
+  const sim = forceSimulation<PinnableSimNode>(simNodes)
+    .force('charge', forceManyBody<PinnableSimNode>().strength(-800).distanceMin(NODE_RADIUS * 2))
+    .force('link', forceLink<PinnableSimNode, SimLink>(links).distance(200).strength(0.15))
+    .force('collide', forceCollide<PinnableSimNode>(NODE_RADIUS + NODE_GAP / 2 + 4).strength(1).iterations(6))
+    .stop()
+
+  for (let i = 0; i < 300; i++) sim.tick()
+
+  const pad = NODE_RADIUS + 8
+  const result: NodeState[] = simNodes.map((n) => ({
+    id: n.id, name: n.name, type: n.type,
+    x: Math.max(pad, Math.min(width - pad, n.x ?? width / 2)),
+    y: Math.max(pad, Math.min(height - pad, n.y ?? height / 2)),
+    vx: 0, vy: 0,
+  }))
+
+  resolveOverlaps(result, width, height)
+  return result
+}
+
 // ─── Graph canvas ─────────────────────────────────────────────────────────────
 
 interface GraphCanvasProps {
@@ -143,18 +199,56 @@ function GraphCanvas({ entities, edges, selectedId, searchQuery, width, height, 
   const panStart = useRef({ x: 0, y: 0 })
   const panOrigin = useRef({ x: 0, y: 0 })
   const svgRef = useRef<SVGSVGElement>(null)
+  const savedPositionsRef = useRef<Map<string, { x: number; y: number }>>(new Map())
+  const initializedRef = useRef(false)
 
   const entityIds = useMemo(() => new Set(entities.map((e) => e.id)), [entities])
   const visibleEdges = useMemo(() => edges.filter((e) => entityIds.has(e.src) && entityIds.has(e.dst)), [edges, entityIds])
 
+  // Keep saved positions in sync with current node positions (including drags)
   useEffect(() => {
-    if (entities.length === 0) { setNodes([]); return }
-    const initial: NodeState[] = entities.map((e) => ({
-      id: e.id, x: width * 0.1 + Math.random() * width * 0.8, y: height * 0.1 + Math.random() * height * 0.8,
-      vx: 0, vy: 0, name: e.name, type: e.type,
-    }))
-    setNodes(runForce(initial, visibleEdges.map((e) => ({ src: e.src, dst: e.dst })), width, height))
-    setPan({ x: 0, y: 0 }); setScale(1)
+    for (const n of nodes) savedPositionsRef.current.set(n.id, { x: n.x, y: n.y })
+  }, [nodes])
+
+  useEffect(() => {
+    if (entities.length === 0) {
+      setNodes([])
+      initializedRef.current = false
+      savedPositionsRef.current.clear()
+      return
+    }
+
+    const saved = savedPositionsRef.current
+    const edgeList = visibleEdges.map((e) => ({ src: e.src, dst: e.dst }))
+
+    if (!initializedRef.current) {
+      const initial: NodeState[] = entities.map((e) => ({
+        id: e.id, x: width * 0.1 + Math.random() * width * 0.8, y: height * 0.1 + Math.random() * height * 0.8,
+        vx: 0, vy: 0, name: e.name, type: e.type,
+      }))
+      setNodes(runForce(initial, edgeList, width, height))
+      setPan({ x: 0, y: 0 }); setScale(1)
+      initializedRef.current = true
+      return
+    }
+
+    // Incremental update: seed existing nodes from saved positions
+    const newNodeIds = new Set(entities.filter((e) => !saved.has(e.id)).map((e) => e.id))
+    const nodeList: NodeState[] = entities.map((e) => {
+      const pos = saved.get(e.id)
+      return {
+        id: e.id,
+        x: pos?.x ?? width / 2 + (Math.random() - 0.5) * 200,
+        y: pos?.y ?? height / 2 + (Math.random() - 0.5) * 200,
+        vx: 0, vy: 0, name: e.name, type: e.type,
+      }
+    })
+
+    if (newNodeIds.size === 0) {
+      setNodes(nodeList)
+    } else {
+      setNodes(runForcePartial(nodeList, edgeList, width, height, newNodeIds))
+    }
   }, [entities, edges, width, height]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const nodeMap = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes])
@@ -304,6 +398,233 @@ function GraphCanvas({ entities, edges, selectedId, searchQuery, width, height, 
   )
 }
 
+// ─── 3D label sprite ─────────────────────────────────────────────────────────
+
+function makeNodeLabel(text: string, color: string): THREE.Sprite {
+  const label = text.length > 18 ? text.slice(0, 17) + '…' : text
+  const canvas = document.createElement('canvas')
+  canvas.width = 256; canvas.height = 40
+  const ctx = canvas.getContext('2d')!
+  ctx.font = 'bold 20px system-ui, sans-serif'
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+  ctx.shadowColor = 'rgba(0,0,0,0.9)'; ctx.shadowBlur = 8
+  ctx.fillStyle = color
+  ctx.fillText(label, 128, 20)
+  const tex = new THREE.CanvasTexture(canvas)
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false })
+  const sprite = new THREE.Sprite(mat)
+  sprite.scale.set(64, 10, 1)
+  return sprite
+}
+
+// ─── 3D Graph canvas ──────────────────────────────────────────────────────────
+
+interface Graph3DCanvasProps {
+  entities: Entity[]
+  edges: Edge[]
+  selectedId: string | null
+  width: number
+  height: number
+  onSelect: (id: string | null) => void
+}
+
+interface ThreeState {
+  renderer: THREE.WebGLRenderer
+  scene: THREE.Scene
+  camera: THREE.PerspectiveCamera
+  controls: OrbitControls
+  rafId: number
+}
+
+function Graph3DCanvas({ entities, edges, selectedId, width, height, onSelect }: Graph3DCanvasProps) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const threeRef = useRef<ThreeState | null>(null)
+  const nodeMeshesRef = useRef<Map<string, THREE.Mesh>>(new Map())
+  const onSelectRef = useRef(onSelect)
+  const selectedIdRef = useRef(selectedId)
+
+  useEffect(() => { onSelectRef.current = onSelect }, [onSelect])
+  useEffect(() => { selectedIdRef.current = selectedId }, [selectedId])
+
+  // Compute 3D positions: d3-force for x/y, type-cluster for z
+  const nodePositions = useMemo(() => {
+    if (entities.length === 0) return new Map<string, THREE.Vector3>()
+    const types = Array.from(new Set(entities.map((e) => e.type))).sort()
+    const mid = (types.length - 1) / 2
+    const zByType = Object.fromEntries(types.map((t, i) => [t, (i - mid) * 100]))
+    const edgeList = edges.map((e) => ({ src: e.src, dst: e.dst }))
+    const initial: NodeState[] = entities.map((e) => ({
+      id: e.id, name: e.name, type: e.type,
+      x: Math.random() * 600, y: Math.random() * 600, vx: 0, vy: 0,
+    }))
+    const laid = runForce(initial, edgeList, 600, 600)
+    const positions = new Map<string, THREE.Vector3>()
+    for (const n of laid) {
+      positions.set(n.id, new THREE.Vector3((n.x - 300) * 1.2, (300 - n.y) * 1.2, zByType[n.type] ?? 0))
+    }
+    return positions
+  }, [entities, edges])
+
+  // Mount Three.js scene once
+  useEffect(() => {
+    if (!containerRef.current) return
+
+    const scene = new THREE.Scene()
+    scene.background = new THREE.Color(0x0d0d1a)
+
+    const camera = new THREE.PerspectiveCamera(60, width / height, 1, 5000)
+    camera.position.set(0, 0, 900)
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true })
+    renderer.setSize(width, height)
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    containerRef.current.appendChild(renderer.domElement)
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.5))
+    const dir = new THREE.DirectionalLight(0xffffff, 1.0)
+    dir.position.set(200, 300, 200)
+    scene.add(dir)
+
+    const controls = new OrbitControls(camera, renderer.domElement)
+    controls.enableDamping = true
+    controls.dampingFactor = 0.08
+
+    let rafId = 0
+    function animate() {
+      rafId = requestAnimationFrame(animate)
+      controls.update()
+      renderer.render(scene, camera)
+    }
+    animate()
+    threeRef.current = { renderer, scene, camera, controls, rafId }
+
+    // Click detection — ignore drags
+    let mouseDownX = 0, mouseDownY = 0
+    const raycaster = new THREE.Raycaster()
+    const mouse = new THREE.Vector2()
+    const onMouseDown = (e: MouseEvent) => { mouseDownX = e.clientX; mouseDownY = e.clientY }
+    const onClick = (e: MouseEvent) => {
+      if (Math.hypot(e.clientX - mouseDownX, e.clientY - mouseDownY) > 5) return
+      const rect = renderer.domElement.getBoundingClientRect()
+      mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1
+      mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1
+      raycaster.setFromCamera(mouse, camera)
+      const hits = raycaster.intersectObjects(Array.from(nodeMeshesRef.current.values()))
+      if (hits.length > 0) {
+        const id = (hits[0].object as THREE.Mesh).userData.entityId as string
+        onSelectRef.current(selectedIdRef.current === id ? null : id)
+      } else {
+        onSelectRef.current(null)
+      }
+    }
+    renderer.domElement.addEventListener('mousedown', onMouseDown)
+    renderer.domElement.addEventListener('click', onClick)
+
+    return () => {
+      cancelAnimationFrame(rafId)
+      controls.dispose()
+      renderer.domElement.removeEventListener('mousedown', onMouseDown)
+      renderer.domElement.removeEventListener('click', onClick)
+      renderer.dispose()
+      containerRef.current?.removeChild(renderer.domElement)
+      threeRef.current = null
+    }
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Rebuild scene graph whenever data or positions change
+  useEffect(() => {
+    const state = threeRef.current
+    if (!state) return
+    const { scene } = state
+
+    // Remove and dispose all previous graph objects
+    const toRemove = scene.children.filter((c) => c.userData.graph)
+    for (const obj of toRemove) {
+      if (obj instanceof THREE.Mesh || obj instanceof THREE.LineSegments) {
+        obj.geometry.dispose()
+        ;(obj.material as THREE.Material).dispose()
+      } else if (obj instanceof THREE.Sprite) {
+        const mat = obj.material as THREE.SpriteMaterial
+        mat.map?.dispose()
+        mat.dispose()
+      }
+      scene.remove(obj)
+    }
+    nodeMeshesRef.current.clear()
+
+    if (entities.length === 0) return
+
+    const nodeIds = new Set(entities.map((e) => e.id))
+    const visibleEdges = edges.filter((e) => nodeIds.has(e.src) && nodeIds.has(e.dst))
+
+    // Edges as line segments
+    const edgeVerts: number[] = []
+    const edgeColors: number[] = []
+    for (const edge of visibleEdges) {
+      const sp = nodePositions.get(edge.src)
+      const ep = nodePositions.get(edge.dst)
+      if (!sp || !ep) continue
+      edgeVerts.push(sp.x, sp.y, sp.z, ep.x, ep.y, ep.z)
+      const c = new THREE.Color(edge.derived ? '#D97706' : '#334455')
+      edgeColors.push(c.r, c.g, c.b, c.r, c.g, c.b)
+
+      // Label at midpoint
+      const labelColor = edge.derived ? '#D97706' : '#94A3B8'
+      const edgeLabel = makeNodeLabel(edge.type, labelColor)
+      edgeLabel.position.set((sp.x + ep.x) / 2, (sp.y + ep.y) / 2, (sp.z + ep.z) / 2)
+      edgeLabel.scale.set(48, 8, 1)
+      edgeLabel.userData = { graph: true }
+      scene.add(edgeLabel)
+    }
+    if (edgeVerts.length > 0) {
+      const geo = new THREE.BufferGeometry()
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(edgeVerts, 3))
+      geo.setAttribute('color', new THREE.Float32BufferAttribute(edgeColors, 3))
+      const lines = new THREE.LineSegments(geo, new THREE.LineBasicMaterial({ vertexColors: true, opacity: 0.5, transparent: true }))
+      lines.userData.graph = true
+      scene.add(lines)
+    }
+
+    // Nodes as spheres
+    const sphereGeo = new THREE.SphereGeometry(10, 32, 24)
+    for (const entity of entities) {
+      const pos = nodePositions.get(entity.id)
+      if (!pos) continue
+      const isSelected = entity.id === selectedId
+      const col = typeColor(entity.type)
+
+      const mat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(col.stroke),
+        emissive: new THREE.Color(col.stroke),
+        emissiveIntensity: isSelected ? 0.7 : 0.35,
+        roughness: 0.35,
+        metalness: 0.1,
+      })
+      const mesh = new THREE.Mesh(sphereGeo, mat)
+      mesh.position.copy(pos)
+      mesh.userData = { graph: true, entityId: entity.id }
+      scene.add(mesh)
+      nodeMeshesRef.current.set(entity.id, mesh)
+
+      const sprite = makeNodeLabel(entity.name, col.fill)
+      sprite.position.set(pos.x, pos.y + 16, pos.z)
+      sprite.userData = { graph: true }
+      scene.add(sprite)
+    }
+  }, [entities, edges, nodePositions, selectedId])
+
+  // Resize
+  useEffect(() => {
+    const state = threeRef.current
+    if (!state) return
+    state.renderer.setSize(width, height)
+    state.camera.aspect = width / height
+    state.camera.updateProjectionMatrix()
+  }, [width, height])
+
+  return <div ref={containerRef} />
+}
+
 // ─── Detail panel ─────────────────────────────────────────────────────────────
 
 interface DetailPanelProps {
@@ -311,13 +632,14 @@ interface DetailPanelProps {
   edgeTypes: EdgeType[]
   edges: Edge[]
   allEntities: Entity[]
+  readOnly?: boolean
   onDelete: (id: string) => Promise<void>
   onUpdate: (id: string, props: Record<string, unknown>) => Promise<void>
   onDeleteEdge: (edgeId: string) => Promise<void>
   onAddEdge: (srcId: string, dstId: string, edgeTypeName: string) => Promise<void>
 }
 
-function DetailPanel({ entity, edgeTypes, edges, allEntities, onDelete, onUpdate, onDeleteEdge, onAddEdge }: DetailPanelProps) {
+function DetailPanel({ entity, edgeTypes, edges, allEntities, readOnly = false, onDelete, onUpdate, onDeleteEdge, onAddEdge }: DetailPanelProps) {
   const colors = typeColor(entity.type)
   const entityMap = useMemo(() => new Map(allEntities.map((e) => [e.id, e])), [allEntities])
 
@@ -335,6 +657,10 @@ function DetailPanel({ entity, edgeTypes, edges, allEntities, onDelete, onUpdate
   useEffect(() => {
     setIsEditing(false); setConfirmDelete(false); setIsAddingEdge(false); setError('')
   }, [entity.id])
+
+  useEffect(() => {
+    if (readOnly) { setIsEditing(false); setIsAddingEdge(false) }
+  }, [readOnly])
 
   const connections = useMemo(() => {
     const out = edges.filter((e) => e.src === entity.id).map((e) => ({ dir: 'out' as const, edge: e, peer: entityMap.get(e.dst) }))
@@ -451,16 +777,21 @@ function DetailPanel({ entity, edgeTypes, edges, allEntities, onDelete, onUpdate
           {entity.id}
         </div>
         <div style={{ display: 'flex', gap: '5px' }}>
-          <button onClick={startEdit} style={btnBase}>Edit</button>
-          {!confirmDelete
-            ? <button onClick={() => setConfirmDelete(true)} style={btnDanger}>Delete</button>
-            : (
-              <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
-                <span style={{ fontSize: '11px', color: '#EF4444', fontFamily: 'var(--font-sans)' }}>Sure?</span>
-                <button onClick={handleDelete} disabled={busy} style={{ ...btnDanger, padding: '2px 6px' }}>{busy ? '…' : 'Yes'}</button>
-                <button onClick={() => setConfirmDelete(false)} style={{ ...btnBase, padding: '2px 6px' }}>No</button>
-              </div>
-            )
+          {readOnly
+            ? <span style={{ fontSize: '11px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-sans)', fontStyle: 'italic' }}>read-only in 3D mode</span>
+            : <>
+                <button onClick={startEdit} style={btnBase}>Edit</button>
+                {!confirmDelete
+                  ? <button onClick={() => setConfirmDelete(true)} style={btnDanger}>Delete</button>
+                  : (
+                    <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                      <span style={{ fontSize: '11px', color: '#EF4444', fontFamily: 'var(--font-sans)' }}>Sure?</span>
+                      <button onClick={handleDelete} disabled={busy} style={{ ...btnDanger, padding: '2px 6px' }}>{busy ? '…' : 'Yes'}</button>
+                      <button onClick={() => setConfirmDelete(false)} style={{ ...btnBase, padding: '2px 6px' }}>No</button>
+                    </div>
+                  )
+                }
+              </>
           }
         </div>
         {error && <div style={{ fontSize: '11px', color: '#EF4444', marginTop: '5px', fontFamily: 'var(--font-sans)' }}>{error}</div>}
@@ -485,8 +816,10 @@ function DetailPanel({ entity, edgeTypes, edges, allEntities, onDelete, onUpdate
           <div style={{ fontSize: '11px', fontWeight: 600, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--color-text-dim)', fontFamily: 'var(--font-sans)' }}>
             Relationships ({connections.length})
           </div>
-          <button onClick={() => { setIsAddingEdge(true); setNewEdgeType(storedEdgeTypes[0]?.name ?? ''); setNewEdgeDst(''); setNewEdgeDir('out'); setError('') }}
-            style={{ ...btnBase, padding: '2px 7px', fontSize: '11px' }}>+ Add</button>
+          {!readOnly && (
+            <button onClick={() => { setIsAddingEdge(true); setNewEdgeType(storedEdgeTypes[0]?.name ?? ''); setNewEdgeDst(''); setNewEdgeDir('out'); setError('') }}
+              style={{ ...btnBase, padding: '2px 7px', fontSize: '11px' }}>+ Add</button>
+          )}
         </div>
 
         {isAddingEdge && (
@@ -494,7 +827,7 @@ function DetailPanel({ entity, edgeTypes, edges, allEntities, onDelete, onUpdate
             <div style={{ display: 'flex', gap: '4px', marginBottom: '5px' }}>
               {(['out', 'in'] as const).map((d) => (
                 <button key={d} onClick={() => setNewEdgeDir(d)}
-                  style={{ ...btnBase, padding: '2px 8px', background: newEdgeDir === d ? 'color-mix(in srgb, var(--color-accent) 12%, transparent)' : undefined, color: newEdgeDir === d ? 'var(--color-accent)' : undefined, borderColor: newEdgeDir === d ? 'var(--color-accent)' : undefined }}>
+                  style={{ ...btnBase, padding: '2px 8px', background: newEdgeDir === d ? 'color-mix(in srgb, var(--color-accent) 12%, transparent)' : undefined, color: newEdgeDir === d ? 'var(--color-accent)' : undefined, border: newEdgeDir === d ? '1px solid var(--color-accent)' : btnBase.border }}>
                   {d === 'out' ? 'this →' : '← this'}
                 </button>
               ))}
@@ -532,7 +865,7 @@ function DetailPanel({ entity, edgeTypes, edges, allEntities, onDelete, onUpdate
                 <div style={{ fontSize: '10px', fontFamily: 'var(--font-mono)', color: 'var(--color-text-dim)' }}>{(dir === 'out' ? edge.dst : edge.src).slice(0, 8)}</div>
               )}
             </div>
-            {!edge.derived && (
+            {!edge.derived && !readOnly && (
               <button onClick={() => handleDeleteEdge(edge.id)}
                 title="Delete this edge"
                 style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--color-text-dim)', fontSize: '13px', padding: '0 2px', flexShrink: 0, lineHeight: 1 }}>×</button>
@@ -605,7 +938,7 @@ function AddEntityForm({ entityTypes, onSave, onCancel }: {
   )
 }
 
-const EXCLUDED_TYPES = new Set(['Run', 'Task', 'Agent'])
+const EXCLUDED_TYPES = new Set(['Run', 'Task', 'Handoff'])
 
 // ─── Schema panel ─────────────────────────────────────────────────────────────
 
@@ -697,11 +1030,17 @@ function SchemaPanel({ entityTypes, edgeTypes, onRefresh }: { entityTypes: Entit
 
 export function OntologyView({ entities, edges, runs: _runs, entityTypes, edgeTypes, onRefresh }: OntologyViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
-  const [dims, setDims] = useState({ width: 800, height: 500 })
+  const [dims, setDims] = useState<{ width: number; height: number } | null>(null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [search, setSearch] = useState('')
-  const [hiddenTypes, setHiddenTypes] = useState<Set<string>>(new Set())
+  const [shownTypes, setShownTypes] = useState<Set<string>>(new Set())
   const [isAddingEntity, setIsAddingEntity] = useState(false)
+  const [viewMode, setViewMode] = useState<'2d' | '3d'>('2d')
+
+  const toggleViewMode = useCallback((mode: '2d' | '3d') => {
+    if (mode === '3d') setIsAddingEntity(false)
+    setViewMode(mode)
+  }, [])
 
   useEffect(() => {
     const el = containerRef.current; if (!el) return
@@ -714,11 +1053,11 @@ export function OntologyView({ entities, edges, runs: _runs, entityTypes, edgeTy
   }, [])
 
   const allTypes = useMemo(() => Array.from(new Set(entities.map((e) => e.type))).filter((t) => !EXCLUDED_TYPES.has(t)).sort(), [entities])
-  const filteredEntities = useMemo(() => entities.filter((e) => !EXCLUDED_TYPES.has(e.type) && !hiddenTypes.has(e.type)), [entities, hiddenTypes])
+  const filteredEntities = useMemo(() => entities.filter((e) => !EXCLUDED_TYPES.has(e.type) && shownTypes.has(e.type)), [entities, shownTypes])
   const selectedEntity = useMemo(() => entities.find((e) => e.id === selectedId) ?? null, [entities, selectedId])
 
   const toggleType = (type: string) => {
-    setHiddenTypes((prev) => { const next = new Set(prev); next.has(type) ? next.delete(type) : next.add(type); return next })
+    setShownTypes((prev: Set<string>) => { const next = new Set(prev); next.has(type) ? next.delete(type) : next.add(type); return next })
     setSelectedId(null)
   }
 
@@ -771,10 +1110,22 @@ export function OntologyView({ entities, edges, runs: _runs, entityTypes, edgeTy
           />
         </div>
 
-        <div style={{ display: 'flex', gap: '5px', flexWrap: 'nowrap', overflow: 'hidden' }}>
+        <div style={{ display: 'flex', gap: '5px', flexWrap: 'nowrap', overflow: 'hidden', alignItems: 'center' }}>
+          <button
+            onClick={() => {
+              if (shownTypes.size === allTypes.length) {
+                setShownTypes(new Set())
+                setSelectedId(null)
+              } else {
+                setShownTypes(new Set(allTypes))
+              }
+            }}
+            style={{ padding: '3px 9px', fontSize: '11px', fontFamily: 'var(--font-sans)', fontWeight: 600, borderRadius: '20px', cursor: 'pointer', border: '1px solid var(--color-border)', background: shownTypes.size === allTypes.length ? 'var(--color-surface-2)' : 'transparent', color: 'var(--color-text-muted)', transition: 'all 100ms ease', whiteSpace: 'nowrap' }}>
+            {shownTypes.size === allTypes.length ? 'None' : 'All'}
+          </button>
           {allTypes.map((type) => {
             const c = typeColor(type)
-            const active = !hiddenTypes.has(type)
+            const active = shownTypes.has(type)
             return (
               <button key={type} onClick={() => toggleType(type)}
                 style={{ padding: '3px 9px', fontSize: '11px', fontFamily: 'var(--font-sans)', fontWeight: 600, borderRadius: '20px', cursor: 'pointer', border: `1px solid ${active ? c.stroke : 'var(--color-border)'}`, background: active ? c.fill : 'transparent', color: active ? c.text : 'var(--color-text-dim)', transition: 'all 100ms ease', whiteSpace: 'nowrap' }}>
@@ -790,9 +1141,18 @@ export function OntologyView({ entities, edges, runs: _runs, entityTypes, edgeTy
               <span style={{ color: 'var(--color-accent)', fontWeight: 700 }}>{n}</span> {label}
             </span>
           ))}
+          <div style={{ display: 'flex', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', overflow: 'hidden' }}>
+            {(['2d', '3d'] as const).map((m) => (
+              <button key={m} onClick={() => toggleViewMode(m)}
+                style={{ ...(viewMode === m ? btnPrimary : btnBase), border: 'none', borderRadius: 0, padding: '3px 10px', textTransform: 'uppercase', fontSize: '11px' }}>
+                {m}
+              </button>
+            ))}
+          </div>
           <button
             onClick={() => { setIsAddingEntity(true); setSelectedId(null) }}
-            style={{ ...btnPrimary, padding: '4px 10px', whiteSpace: 'nowrap' }}>
+            disabled={viewMode === '3d'}
+            style={{ ...btnPrimary, padding: '4px 10px', whiteSpace: 'nowrap', opacity: viewMode === '3d' ? 0.4 : 1 }}>
             + Entity
           </button>
         </div>
@@ -801,12 +1161,20 @@ export function OntologyView({ entities, edges, runs: _runs, entityTypes, edgeTy
       {/* Body */}
       <div style={{ display: 'flex', flex: '1 1 auto', overflow: 'hidden' }}>
         <div ref={containerRef} style={{ flex: '1 1 auto', overflow: 'hidden', position: 'relative' }}>
-          <GraphCanvas
-            entities={filteredEntities} edges={edges}
-            selectedId={selectedId} searchQuery={search}
-            width={dims.width} height={dims.height}
-            onSelect={handleSelect}
-          />
+          {dims && (viewMode === '3d'
+            ? <Graph3DCanvas
+                entities={filteredEntities} edges={edges}
+                selectedId={selectedId}
+                width={dims.width} height={dims.height}
+                onSelect={handleSelect}
+              />
+            : <GraphCanvas
+                entities={filteredEntities} edges={edges}
+                selectedId={selectedId} searchQuery={search}
+                width={dims.width} height={dims.height}
+                onSelect={handleSelect}
+              />
+          )}
         </div>
 
         <div style={{ width: '240px', flexShrink: 0, borderLeft: '1px solid var(--color-border)', overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
@@ -832,6 +1200,7 @@ export function OntologyView({ entities, edges, runs: _runs, entityTypes, edgeTy
                   edgeTypes={edgeTypes}
                   edges={edges}
                   allEntities={entities}
+                  readOnly={viewMode === '3d'}
                   onDelete={handleDeleteEntity}
                   onUpdate={handleUpdateEntity}
                   onDeleteEdge={handleDeleteEdge}
@@ -847,7 +1216,9 @@ export function OntologyView({ entities, edges, runs: _runs, entityTypes, edgeTy
 
       {/* Legend */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '14px', padding: '5px 14px', borderTop: '1px solid var(--color-border)', background: 'var(--color-surface)', flexShrink: 0 }}>
-        <span style={{ fontSize: '11px', color: 'var(--color-text-dim)' }}>Click node for details · Drag · Scroll to zoom</span>
+        <span style={{ fontSize: '11px', color: 'var(--color-text-dim)' }}>
+          Click node for details · {viewMode === '3d' ? 'Drag to rotate' : 'Drag'} · Scroll to zoom
+        </span>
         <div style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
           <svg width="24" height="8"><line x1="0" y1="4" x2="24" y2="4" stroke="var(--color-border-2)" strokeWidth="1.5" /></svg>
           <span style={{ fontSize: '11px', color: 'var(--color-text-muted)' }}>stored</span>
