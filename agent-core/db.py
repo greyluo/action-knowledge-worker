@@ -63,6 +63,7 @@ class Run(Base):
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     in_service_of_task_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     parent_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("runs.id", ondelete="SET NULL"), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
 
 class Message(Base):
@@ -148,6 +149,8 @@ class PolicyRule(Base):
     subject_key: Mapped[str] = mapped_column(String, nullable=False)
     subject_type: Mapped[str] = mapped_column(String, nullable=False)
     blocking_conditions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    subject_source: Mapped[str] = mapped_column(String(20), nullable=False, default="tool_input")
+    tool_input_filter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
