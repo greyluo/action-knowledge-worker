@@ -1,4 +1,4 @@
-import type { AgentSpec, Entity, Edge, Run, OntologyEvent, Task, Message, EntityType, EdgeType } from './types'
+import type { AgentSpec, Entity, Edge, Run, OntologyEvent, Task, Message, EntityType, EdgeType, Policy, BlockingCondition } from './types'
 
 const BASE = 'http://localhost:8001'
 
@@ -90,6 +90,105 @@ export async function updateAgent(
   })
   if (!res.ok) throw new Error(`Update agent failed: ${res.status}`)
   return res.json()
+}
+
+export async function deleteAgent(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/agents/${id}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Delete agent failed: ${res.status}`)
+}
+
+export async function deleteTask(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/tasks/${id}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Delete task failed: ${res.status}`)
+}
+
+export async function createEntityType(name: string, canonical_key?: string, description?: string): Promise<EntityType> {
+  const res = await fetch(`${BASE}/schema/entity-types`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, canonical_key: canonical_key || null, description: description || null }),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`Create entity type failed: ${res.status} ${text}`)
+  }
+  return res.json()
+}
+
+export async function createEntity(type_name: string, properties: Record<string, unknown>): Promise<Entity> {
+  const res = await fetch(`${BASE}/entities`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type_name, properties }),
+  })
+  if (!res.ok) throw new Error(`Create entity failed: ${res.status}`)
+  return res.json()
+}
+
+export async function updateEntityProps(id: string, properties: Record<string, unknown>): Promise<Entity> {
+  const res = await fetch(`${BASE}/entities/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ properties }),
+  })
+  if (!res.ok) throw new Error(`Update entity failed: ${res.status}`)
+  return res.json()
+}
+
+export async function deleteEntity(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/entities/${id}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Delete entity failed: ${res.status}`)
+}
+
+export async function createEdgeApi(src_id: string, dst_id: string, edge_type_name: string): Promise<Edge> {
+  const res = await fetch(`${BASE}/edges`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ src_id, dst_id, edge_type_name }),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`Create edge failed: ${res.status} ${text}`)
+  }
+  return res.json()
+}
+
+export async function deleteEdge(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/edges/${id}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Delete edge failed: ${res.status}`)
+}
+
+export const getPolicies = (): Promise<Policy[]> => get('/policies')
+
+export async function createPolicy(data: {
+  name: string
+  tool_pattern: string
+  subject_key: string
+  subject_type: string
+  blocking_conditions: BlockingCondition[]
+}): Promise<Policy> {
+  const res = await fetch(`${BASE}/policies`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  })
+  if (!res.ok) throw new Error(`Create policy failed: ${res.status}`)
+  return res.json()
+}
+
+export async function togglePolicy(id: string, enabled: boolean): Promise<Policy> {
+  const res = await fetch(`${BASE}/policies/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  })
+  if (!res.ok) throw new Error(`Update policy failed: ${res.status}`)
+  return res.json()
+}
+
+export async function deletePolicy(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/policies/${id}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`Delete policy failed: ${res.status}`)
 }
 
 async function parseSseStream(
