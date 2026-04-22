@@ -324,7 +324,7 @@ async def _delegate_task_impl(args: dict, run_ctx, *, _session=None) -> dict:
     to_agent_spec_id: str = args.get("to_agent_id", "")
     task_prompt: str = args.get("task_prompt", "")
     context_entity_ids: list = args.get("context_entity_ids") or []
-    execution_mode: str = args.get("execution_mode", "wait")
+    execution_mode: str = args.get("execution_mode", "fire_and_forget")
     handoff_summary: str = args.get("handoff_summary", "")
 
     async with _get_session() as session:

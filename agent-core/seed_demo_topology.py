@@ -20,7 +20,9 @@ DEMO_AGENTS = [
             "and people using fetch_company_data and fetch_email_thread, then write "
             "structured entities to the graph. Do NOT analyze or interpret — only gather "
             "and record. When done, call delegate_task to pass your findings to the "
-            "next agent in the chain. Finish with OUTCOME_SUMMARY: listing every entity you wrote."
+            "next agent in the chain. Use execution_mode=fire_and_forget. "
+            "Pass the spec_id of the target agent (NOT an entity ID) as to_agent_id. "
+            "Finish with OUTCOME_SUMMARY: listing every entity you wrote."
         ),
         "allowed_tools": [
             "mcp__demo__fetch_company_data",
@@ -97,8 +99,10 @@ async def seed_demo_topology():
                 spec_id = spec.id
                 print(f"Created spec: {agent_def['name']} ({spec_id})")
             else:
+                existing.system_prompt = agent_def["system_prompt"]
+                existing.allowed_tools = agent_def["allowed_tools"]
                 spec_id = existing.id
-                print(f"Exists spec: {agent_def['name']} ({spec_id})")
+                print(f"Updated spec: {agent_def['name']} ({spec_id})")
 
             spec_map[agent_def["name"]] = spec_id
 
