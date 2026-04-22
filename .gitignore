@@ -1,7 +1,14 @@
 docs/
 .worktrees/
 .env
+CLAUDE.md
 __pycache__/
 *.egg-info/
 *.pyc
 .pytest_cache/
+
+# frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.env*
