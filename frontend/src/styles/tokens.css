@@ -1,0 +1,44 @@
+@import url('https://fonts.googleapis.com/css2?family=Epilogue:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;1,400&display=swap');
+
+:root {
+  /* Backgrounds */
+  --color-bg:        #F2F3F8;
+  --color-surface:   #FFFFFF;
+  --color-surface-2: #F0F1F8;
+  --color-surface-3: #E8EAF2;
+  --color-border:    #E2E4EF;
+  --color-border-2:  #CDD0E3;
+
+  /* Text */
+  --color-text:       #1A1B2E;
+  --color-text-muted: #5C5E7A;
+  --color-text-dim:   #9698B8;
+
+  /* Accent — deep teal (darkened for contrast on light) */
+  --color-accent:       #0D9E83;
+  --color-accent-hover: #0B8C74;
+  --color-accent-bg:    rgba(13,158,131,0.07);
+  --color-accent-glow:  rgba(13,158,131,0.18);
+
+  /* Semantic */
+  --color-success:    #059669;
+  --color-success-bg: rgba(5,150,105,0.08);
+  --color-warning:    #D97706;
+  --color-warning-bg: rgba(217,119,6,0.08);
+  --color-error:      #DC2626;
+  --color-error-bg:   rgba(220,38,38,0.08);
+
+  /* Typography */
+  --font-sans: 'Epilogue', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+
+  /* Geometry */
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --radius-lg: 12px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.05);
+  --shadow-md: 0 4px 14px rgba(0,0,0,0.10), 0 2px 6px rgba(0,0,0,0.06);
+  --shadow-lg: 0 10px 30px rgba(0,0,0,0.12), 0 4px 14px rgba(0,0,0,0.08);
+}
