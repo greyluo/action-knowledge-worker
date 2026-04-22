@@ -398,6 +398,12 @@ function GraphCanvas({ entities, edges, selectedId, searchQuery, width, height, 
   )
 }
 
+function hashFloat(str: string): number {
+  let h = 0
+  for (let i = 0; i < str.length; i++) h = (Math.imul(31, h) + str.charCodeAt(i)) >>> 0
+  return h / 0xffffffff
+}
+
 // ─── 3D label sprite ─────────────────────────────────────────────────────────
 
 function makeNodeLabel(text: string, color: string): THREE.Sprite {
@@ -455,7 +461,7 @@ function Graph3DCanvas({ entities, edges, selectedId, width, height, onSelect }:
     const edgeList = edges.map((e) => ({ src: e.src, dst: e.dst }))
     const initial: NodeState[] = entities.map((e) => ({
       id: e.id, name: e.name, type: e.type,
-      x: Math.random() * 600, y: Math.random() * 600, vx: 0, vy: 0,
+      x: hashFloat(e.id) * 600, y: hashFloat(e.id + 'y') * 600, vx: 0, vy: 0,
     }))
     const laid = runForce(initial, edgeList, 600, 600)
     const positions = new Map<string, THREE.Vector3>()
@@ -599,6 +605,8 @@ function Graph3DCanvas({ entities, edges, selectedId, width, height, onSelect }:
         emissiveIntensity: isSelected ? 0.7 : 0.35,
         roughness: 0.35,
         metalness: 0.1,
+        transparent: true,
+        opacity: 0.5,
       })
       const mesh = new THREE.Mesh(sphereGeo, mat)
       mesh.position.copy(pos)
@@ -607,7 +615,8 @@ function Graph3DCanvas({ entities, edges, selectedId, width, height, onSelect }:
       nodeMeshesRef.current.set(entity.id, mesh)
 
       const sprite = makeNodeLabel(entity.name, col.fill)
-      sprite.position.set(pos.x, pos.y + 16, pos.z)
+      ;(sprite.material as THREE.SpriteMaterial).depthTest = false
+      sprite.position.set(pos.x, pos.y, pos.z)
       sprite.userData = { graph: true }
       scene.add(sprite)
     }

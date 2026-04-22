@@ -92,6 +92,7 @@ interface PolicyDraft {
   tool_pattern: string
   subject_key: string
   subject_type: string
+  subject_source: string
   blocking_conditions: BlockingCondition[]
 }
 
@@ -114,16 +115,21 @@ function DraftPreview({ draft }: { draft: PolicyDraft }) {
       </code>
 
       <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '8px' }}>
-        <span style={{ fontSize: '10px', padding: '1px 5px', borderRadius: '8px', background: '#EFF6FF', color: '#3B82F6', border: '1px solid #BFDBFE', fontFamily: 'var(--font-sans)', fontWeight: 600 }}>
-          {draft.subject_type}
+        <span style={{ fontSize: '10px', padding: '1px 5px', borderRadius: '8px', background: draft.subject_source === 'actor' ? '#F0FDF4' : '#EFF6FF', color: draft.subject_source === 'actor' ? '#15803D' : '#3B82F6', border: `1px solid ${draft.subject_source === 'actor' ? '#BBF7D0' : '#BFDBFE'}`, fontFamily: 'var(--font-sans)', fontWeight: 600 }}>
+          {draft.subject_source === 'actor' ? 'actor' : draft.subject_type || 'tool_input'}
         </span>
-        <span style={{ fontSize: '10px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-mono)', alignSelf: 'center' }}>
-          key: {draft.subject_key}
-        </span>
+        {draft.subject_source !== 'actor' && (
+          <span style={{ fontSize: '10px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-mono)', alignSelf: 'center' }}>
+            key: {draft.subject_key}
+          </span>
+        )}
       </div>
 
       {draft.blocking_conditions.map((cond, i) => (
-        <div key={i} style={{ fontSize: '11px', fontFamily: 'var(--font-sans)', color: 'var(--color-text-muted)', background: 'var(--color-surface)', borderRadius: 'var(--radius-sm)', padding: '5px 8px', borderLeft: '2px solid #F97316', marginBottom: '4px' }}>
+        <div key={i} style={{ fontSize: '11px', fontFamily: 'var(--font-sans)', color: 'var(--color-text-muted)', background: 'var(--color-surface)', borderRadius: 'var(--radius-sm)', padding: '5px 8px', borderLeft: `2px solid ${cond.invert ? '#8B5CF6' : '#F97316'}`, marginBottom: '4px' }}>
+          <span style={{ fontSize: '10px', color: cond.invert ? '#8B5CF6' : '#F97316', fontFamily: 'var(--font-mono)', marginRight: '4px' }}>
+            {cond.invert ? 'block if absent' : 'block if present'}
+          </span>
           <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--color-text)', fontWeight: 600 }}>{cond.edge_type}</span>
           {cond.target_type && <span> → <span style={{ fontFamily: 'var(--font-mono)', color: '#22C55E' }}>{cond.target_type}</span></span>}
           {Object.entries(cond.blocking_target_states).map(([k, vals]) => (
@@ -301,6 +307,7 @@ export function PoliciesPanel({ policies, entityTypes, edgeTypes, tools, onRefre
       tool_pattern: draft.tool_pattern,
       subject_key: draft.subject_key,
       subject_type: draft.subject_type,
+      subject_source: draft.subject_source,
       blocking_conditions: draft.blocking_conditions,
     })
     setIsAdding(false)
