@@ -1,5 +1,5 @@
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,6 +15,8 @@ class RunContext:
     task_id: uuid.UUID | None
     spec: AgentSpec
     agent_entity_id: uuid.UUID
+    parent_run_id: uuid.UUID | None = None
+    context_entity_ids: list[str] = field(default_factory=list)
 
 
 async def load_spec(session: AsyncSession, spec_id: uuid.UUID) -> AgentSpec:
@@ -43,6 +45,8 @@ async def begin_run(
     spec: AgentSpec,
     agent_entity_id: uuid.UUID,
     task_id: uuid.UUID | None = None,
+    parent_run_id: uuid.UUID | None = None,
+    context_entity_ids: list[str] | None = None,
 ) -> RunContext:
     if task_id:
         task_entity = await session.get(Entity, task_id)
@@ -76,7 +80,7 @@ async def begin_run(
             await session.flush()
             task_id = task_entity.id
 
-    run = Run(spec_id=spec.id, in_service_of_task_id=task_id)
+    run = Run(spec_id=spec.id, in_service_of_task_id=task_id, parent_run_id=parent_run_id)
     session.add(run)
     await session.flush()
 
@@ -92,7 +96,14 @@ async def begin_run(
         created_in_run_id=run.id,
     ))
 
-    return RunContext(run_id=run.id, task_id=task_id, spec=spec, agent_entity_id=agent_entity_id)
+    return RunContext(
+        run_id=run.id,
+        task_id=task_id,
+        spec=spec,
+        agent_entity_id=agent_entity_id,
+        parent_run_id=parent_run_id,
+        context_entity_ids=context_entity_ids or [],
+    )
 
 
 async def _maybe_resume_task(session: AsyncSession, prompt: str) -> Entity | None:
@@ -191,6 +202,7 @@ def build_options_from_spec(
     run_ctx: RunContext,
     streaming_hook=None,
     permission_mode: str | None = None,
+    resume_session_id: str | None = None,
 ):
     """Build ClaudeAgentOptions from a spec and run context.
 
@@ -209,6 +221,15 @@ def build_options_from_spec(
         system_prompt = _BASE_PROMPT + "\n\n## Agent goal\n" + spec.system_prompt.strip()
     else:
         system_prompt = _BASE_PROMPT
+
+    if run_ctx.context_entity_ids:
+        ids_str = ", ".join(run_ctx.context_entity_ids)
+        context_hint = (
+            f"\n\n## Delegated context\nYou were delegated this task. "
+            f"Your context entities are pre-loaded in the graph (IDs: {ids_str}). "
+            f"Start by calling query_graph with your task ID to retrieve them."
+        )
+        system_prompt = system_prompt + context_hint
 
     allowed_tools = list(_ONTOLOGY_TOOLS | set(spec.allowed_tools or []))
 
@@ -272,6 +293,8 @@ def build_options_from_spec(
     kwargs = {}
     if permission_mode is not None:
         kwargs["permission_mode"] = permission_mode
+    if resume_session_id is not None:
+        kwargs["resume"] = resume_session_id
 
     return ClaudeAgentOptions(
         system_prompt=system_prompt,
