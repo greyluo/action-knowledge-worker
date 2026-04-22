@@ -130,11 +130,11 @@ SEED_EDGE_TYPES = [
     {"name": "in_service_of", "is_transitive": False, "is_inverse_of": None},
     {"name": "part_of", "is_transitive": True, "is_inverse_of": None},
     {"name": "produced", "is_transitive": False, "is_inverse_of": None},
-    {"name": "manages", "is_transitive": True, "is_inverse_of": "reports_to"},
+    {"name": "manages", "is_transitive": True, "is_inverse_of": "reports_to", "synonyms": ["assigned_to", "owns"]},
     {"name": "reports_to", "is_transitive": False, "is_inverse_of": "manages"},
-    {"name": "owns", "is_transitive": False, "is_inverse_of": "owned_by"},
+    {"name": "owns", "is_transitive": False, "is_inverse_of": "owned_by", "synonyms": ["manages", "assigned_to"]},
     {"name": "owned_by", "is_transitive": False, "is_inverse_of": "owns"},
-    {"name": "assigned_to", "is_transitive": False, "is_inverse_of": "has_assignee"},
+    {"name": "assigned_to", "is_transitive": False, "is_inverse_of": "has_assignee", "synonyms": ["manages", "owns"]},
     {"name": "has_assignee", "is_transitive": False, "is_inverse_of": "assigned_to"},
     # Multi-agent topology edges
     {"name": "delegates_to", "is_transitive": False, "is_inverse_of": None},
@@ -178,6 +178,8 @@ async def run_seed(session: AsyncSession) -> uuid.UUID:
         existing = await session.scalar(select(EdgeType).where(EdgeType.name == e["name"]))
         if not existing:
             session.add(EdgeType(**e))
+        elif "synonyms" in e:
+            existing.synonyms = e["synonyms"]
 
     _allowed_tools = [
         "mcp__demo__fetch_company_data",
@@ -242,6 +244,23 @@ _SEED_POLICIES = [
                 "message_template": (
                     "{subject} is assigned to {count} active project(s): {targets}. "
                     "Termination is blocked until their project assignments are resolved."
+                ),
+            }
+        ],
+    },
+    {
+        "name": "block_termination_if_manages_deal",
+        "tool_pattern": r"terminate_employee",
+        "subject_key": "employee_name",
+        "subject_type": "Person",
+        "blocking_conditions": [
+            {
+                "edge_type": ["manages", "assigned_to"],
+                "target_type": "Deal",
+                "blocking_target_states": {},
+                "message_template": (
+                    "{subject} manages {count} deal(s): {targets}. "
+                    "Termination is blocked until their deals are reassigned or closed."
                 ),
             }
         ],

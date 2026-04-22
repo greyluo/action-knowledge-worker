@@ -46,7 +46,7 @@ _SCHEMA = """\
       "edge_type": "<edge type name from the list>",
       "target_type": "<entity type name or null>",
       "blocking_target_states": {"<property>": ["<blocking value>"]},
-      "invert": "<false to block when edge present; true to block when edge absent>",
+      "invert": false,
       "message_template": "<message; use {subject}, {count}, {targets} as placeholders>"
     }
   ]

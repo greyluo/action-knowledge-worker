@@ -36,9 +36,9 @@ class GraphCondition:
     invert=True: block when no matching edge is found (e.g. "deny access unless the
     calling agent has a 'handles' edge to the requested resource type").
     """
-    edge_type: str
+    edge_type: str | list[str]  # single name or list of equivalent edge types (OR semantics)
     target_type: str | None = None
-    blocking_target_states: dict[str, list[Any]] = field(default_factory=dict)
+    blocking_target_states: dict[str, list[Any]] = field(default_factory=dict)  # empty = any target
     message_template: str = "{subject} has active {edge_type} relationship(s)"
     invert: bool = False
 
@@ -63,7 +63,7 @@ class ActionPolicy:
 def _row_to_policy(row: PolicyRule) -> ActionPolicy:
     conditions = [
         GraphCondition(
-            edge_type=c["edge_type"],
+            edge_type=c["edge_type"],  # str or list[str] — both handled by _check_condition
             target_type=c.get("target_type"),
             blocking_target_states=c.get("blocking_target_states", {}),
             message_template=c.get("message_template", "{subject} has active {edge_type} relationship(s)"),
@@ -141,18 +141,35 @@ async def _find_entity(session, type_name: str, name_value: str) -> "Entity | No
 
 
 async def _check_condition(session, subject: "Entity", cond: GraphCondition) -> str | None:
-    et = await session.scalar(select(EdgeType).where(EdgeType.name == cond.edge_type))
-    if not et:
-        return None
+    explicit_names = cond.edge_type if isinstance(cond.edge_type, list) else [cond.edge_type]
 
-    edges = (
-        await session.execute(
-            select(Edge).where(
-                Edge.src_id == subject.id,
-                Edge.edge_type_id == et.id,
+    # Expand each named edge type to include its DB-defined synonyms
+    expanded: list[str] = []
+    for et_name in explicit_names:
+        if et_name not in expanded:
+            expanded.append(et_name)
+        et = await session.scalar(select(EdgeType).where(EdgeType.name == et_name))
+        if et and et.synonyms:
+            for syn in et.synonyms:
+                if syn not in expanded:
+                    expanded.append(syn)
+
+    edge_type_label = " / ".join(expanded)
+
+    edges = []
+    for et_name in expanded:
+        et = await session.scalar(select(EdgeType).where(EdgeType.name == et_name))
+        if not et:
+            continue
+        batch = (
+            await session.execute(
+                select(Edge).where(
+                    Edge.src_id == subject.id,
+                    Edge.edge_type_id == et.id,
+                )
             )
-        )
-    ).scalars().all()
+        ).scalars().all()
+        edges.extend(batch)
 
     blocking_targets: list[str] = []
     for edge in edges:
@@ -182,7 +199,7 @@ async def _check_condition(session, subject: "Entity", cond: GraphCondition) -> 
         return (
             cond.message_template
             .replace("{subject}", subject_name)
-            .replace("{edge_type}", cond.edge_type)
+            .replace("{edge_type}", edge_type_label)
             .replace("{count}", str(len(targets)))
             .replace("{targets}", ", ".join(f'"{t}"' for t in targets))
         )
