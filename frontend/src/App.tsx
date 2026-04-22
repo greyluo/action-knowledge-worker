@@ -4,7 +4,6 @@ import { BuilderPanel } from './components/builder/BuilderPanel'
 import { SpacePanel } from './components/space/SpacePanel'
 import { OntologyView } from './components/ontology/OntologyView'
 import { PoliciesPanel } from './components/policies/PoliciesPanel'
-import { TopologyPanel } from './components/topology/TopologyPanel'
 import {
   getAgents, getAgentTasks, getTaskMessages,
   getEntities, getEdges, getRuns,
@@ -16,7 +15,7 @@ import type { AgentSpec, Message, Task, Entity, Edge, Run, EntityType, EdgeType,
 import './styles/tokens.css'
 import './App.css'
 
-type Tab = 'workspace' | 'ontology' | 'policies' | 'topology'
+type Tab = 'workspace' | 'ontology' | 'policies'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('workspace')
@@ -90,18 +89,19 @@ export default function App() {
   }, [])
 
   const handleSend = (text: string) => {
+    const sentTaskId = selectedTaskId
     const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     const userMsg: Message = { id: `msg-${Date.now()}`, role: 'user', content: text, timestamp: now }
-    setMessages((prev) => ({ ...prev, [selectedTaskId]: [...(prev[selectedTaskId] ?? []), userMsg] }))
+    setMessages((prev) => ({ ...prev, [sentTaskId]: [...(prev[sentTaskId] ?? []), userMsg] }))
     setIsAgentStreaming(true)
 
-    streamChat(selectedAgentId, selectedTaskId || null, text, {
+    streamChat(selectedAgentId, sentTaskId || null, text, {
       onMessage: (content) => {
         const agentMsg: Message = {
           id: `msg-${Date.now()}-agent`, role: 'agent', content,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         }
-        setMessages((prev) => ({ ...prev, [selectedTaskId]: [...(prev[selectedTaskId] ?? []), agentMsg] }))
+        setMessages((prev) => ({ ...prev, [sentTaskId]: [...(prev[sentTaskId] ?? []), agentMsg] }))
       },
       onDone: (_runId, taskId) => {
         setIsAgentStreaming(false)
@@ -114,8 +114,18 @@ export default function App() {
         if (taskId) {
           getTaskMessages(taskId).then((loaded) => {
             const visible = loaded.filter((m) => m.content.trim() || (m.tool_calls && m.tool_calls.length > 0))
-            setMessages((prev) => ({ ...prev, [taskId]: visible }))
-            setSelectedTaskIds((prev) => ({ ...prev, [selectedAgentId]: taskId }))
+            setMessages((prev) => {
+              const next = { ...prev, [taskId]: visible }
+              if (sentTaskId === '') delete next['']
+              return next
+            })
+            setSelectedTaskIds((prev) => {
+              const current = prev[selectedAgentId]
+              if (current === sentTaskId || sentTaskId === '') {
+                return { ...prev, [selectedAgentId]: taskId }
+              }
+              return prev
+            })
           }).catch(console.error)
         }
       },
@@ -218,14 +228,6 @@ export default function App() {
         />
       )}
 
-      {tab === 'topology' && (
-        <TopologyPanel
-          agents={agents}
-          edges={edges}
-          edgeTypes={edgeTypes}
-          onEdgesChanged={loadEdges}
-        />
-      )}
     </div>
   )
 }

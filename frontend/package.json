@@ -12,7 +12,9 @@
     "d3-force": "^3.0.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "react-markdown": "^10.1.0"
+    "react-force-graph-3d": "^1.29.1",
+    "react-markdown": "^10.1.0",
+    "three": "^0.184.0"
   },
   "devDependencies": {
     "@types/react": "^19.1.0",

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 
-type Tab = 'workspace' | 'ontology' | 'policies' | 'topology'
+type Tab = 'workspace' | 'ontology' | 'policies'
 
 interface TopBarProps {
   activeTab: Tab
@@ -11,7 +11,6 @@ const TABS: Array<{ key: Tab; label: string }> = [
   { key: 'workspace', label: 'Workspace' },
   { key: 'ontology', label: 'Ontology' },
   { key: 'policies', label: 'Policies' },
-  { key: 'topology', label: 'Topology' },
 ]
 
 export function TopBar({ activeTab, onTabChange }: TopBarProps) {

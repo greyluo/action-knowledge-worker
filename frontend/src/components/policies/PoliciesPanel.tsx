@@ -1,8 +1,8 @@
 import { useState } from 'react'
-import type { Policy, EntityType, EdgeType, BlockingCondition } from '../../types'
-import { createPolicy, togglePolicy, deletePolicy } from '../../api'
+import type { Policy, EntityType, EdgeType, BlockingCondition, ToolDef } from '../../types'
+import { createPolicy, togglePolicy, deletePolicy, generatePolicy } from '../../api'
 
-// ─── Shared styles (matching OntologyView conventions) ────────────────────────
+// ─── Shared styles ────────────────────────────────────────────────────────────
 
 const btnBase: React.CSSProperties = {
   fontSize: '11px', fontFamily: 'var(--font-sans)', fontWeight: 600,
@@ -17,24 +17,10 @@ const btnPrimary: React.CSSProperties = {
   ...btnBase, color: 'var(--color-accent)', borderColor: 'var(--color-accent)',
   background: 'color-mix(in srgb, var(--color-accent) 8%, transparent)',
 }
-const inputStyle: React.CSSProperties = {
-  fontSize: '11px', fontFamily: 'var(--font-mono)', padding: '4px 7px',
-  borderRadius: 'var(--radius-sm)', border: '1px solid var(--color-border)',
-  background: 'var(--color-surface-2)', color: 'var(--color-text)',
-  outline: 'none', width: '100%', boxSizing: 'border-box',
-}
-const labelStyle: React.CSSProperties = {
-  fontSize: '11px', fontWeight: 600, color: 'var(--color-text-dim)',
-  fontFamily: 'var(--font-sans)', marginBottom: '3px', display: 'block',
-}
 
 // ─── Policy card ──────────────────────────────────────────────────────────────
 
-function PolicyCard({
-  policy,
-  onToggle,
-  onDelete,
-}: {
+function PolicyCard({ policy, onToggle, onDelete }: {
   policy: Policy
   onToggle: (id: string, enabled: boolean) => void
   onDelete: (id: string) => void
@@ -90,7 +76,7 @@ function PolicyCard({
           {cond.target_type && <span> → <span style={{ fontFamily: 'var(--font-mono)', color: '#22C55E' }}>{cond.target_type}</span></span>}
           {Object.entries(cond.blocking_target_states).map(([k, vals]) => (
             <span key={k} style={{ marginLeft: '4px', color: 'var(--color-text-dim)' }}>
-              [{k}: {vals.join(', ')}]
+              [{k}: {(Array.isArray(vals) ? vals : [vals]).join(', ')}]
             </span>
           ))}
         </div>
@@ -99,132 +85,188 @@ function PolicyCard({
   )
 }
 
-// ─── Add policy form ──────────────────────────────────────────────────────────
+// ─── Policy draft preview (read-only card) ────────────────────────────────────
 
-const DEFAULT_TEMPLATE =
-  '{subject} is assigned to {count} active project(s): {targets}. ' +
-  'Termination is blocked until their project assignments are resolved.'
+interface PolicyDraft {
+  name: string
+  tool_pattern: string
+  subject_key: string
+  subject_type: string
+  blocking_conditions: BlockingCondition[]
+}
 
-function AddPolicyForm({
-  entityTypes,
-  edgeTypes,
-  onSave,
-  onCancel,
-}: {
-  entityTypes: EntityType[]
-  edgeTypes: EdgeType[]
-  onSave: (policy: Omit<Policy, 'id' | 'created_at'>) => Promise<void>
+function DraftPreview({ draft }: { draft: PolicyDraft }) {
+  return (
+    <div style={{
+      padding: '10px 12px', borderRadius: 'var(--radius-md)',
+      background: 'var(--color-surface-2)',
+      border: '1px solid var(--color-accent)',
+      marginBottom: '10px',
+    }}>
+      <div style={{ fontSize: '10px', fontFamily: 'var(--font-mono)', letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--color-accent)', marginBottom: '8px' }}>
+        generated preview
+      </div>
+      <div style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text)', fontFamily: 'var(--font-sans)', marginBottom: '4px' }}>
+        {draft.name}
+      </div>
+      <code style={{ fontSize: '10px', color: 'var(--color-text-muted)', fontFamily: 'var(--font-mono)', background: 'var(--color-surface)', padding: '1px 4px', borderRadius: '3px', display: 'inline-block', marginBottom: '8px' }}>
+        {draft.tool_pattern}
+      </code>
+
+      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '8px' }}>
+        <span style={{ fontSize: '10px', padding: '1px 5px', borderRadius: '8px', background: '#EFF6FF', color: '#3B82F6', border: '1px solid #BFDBFE', fontFamily: 'var(--font-sans)', fontWeight: 600 }}>
+          {draft.subject_type}
+        </span>
+        <span style={{ fontSize: '10px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-mono)', alignSelf: 'center' }}>
+          key: {draft.subject_key}
+        </span>
+      </div>
+
+      {draft.blocking_conditions.map((cond, i) => (
+        <div key={i} style={{ fontSize: '11px', fontFamily: 'var(--font-sans)', color: 'var(--color-text-muted)', background: 'var(--color-surface)', borderRadius: 'var(--radius-sm)', padding: '5px 8px', borderLeft: '2px solid #F97316', marginBottom: '4px' }}>
+          <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--color-text)', fontWeight: 600 }}>{cond.edge_type}</span>
+          {cond.target_type && <span> → <span style={{ fontFamily: 'var(--font-mono)', color: '#22C55E' }}>{cond.target_type}</span></span>}
+          {Object.entries(cond.blocking_target_states).map(([k, vals]) => (
+            <span key={k} style={{ marginLeft: '4px', color: 'var(--color-text-dim)' }}>
+              [{k}: {(Array.isArray(vals) ? vals : [vals]).join(', ')}]
+            </span>
+          ))}
+          {cond.message_template && (
+            <div style={{ fontSize: '10px', color: 'var(--color-text-dim)', marginTop: '4px', fontStyle: 'italic' }}>
+              {cond.message_template}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ─── AI-driven generation flow ────────────────────────────────────────────────
+
+type GenMode = 'describe' | 'generating' | 'preview'
+
+function GeneratePolicyFlow({ onSave, onCancel }: {
+  onSave: (draft: PolicyDraft) => Promise<void>
   onCancel: () => void
 }) {
-  const [name, setName] = useState('')
-  const [toolPattern, setToolPattern] = useState('')
-  const [subjectKey, setSubjectKey] = useState('employee_name')
-  const [subjectType, setSubjectType] = useState(entityTypes[0]?.name ?? '')
-  const [edgeType, setEdgeType] = useState(edgeTypes[0]?.name ?? '')
-  const [targetType, setTargetType] = useState('')
-  const [stateKey, setStateKey] = useState('status')
-  const [stateValues, setStateValues] = useState('pending, in_progress, active')
-  const [messageTemplate, setMessageTemplate] = useState(DEFAULT_TEMPLATE)
-  const [busy, setBusy] = useState(false)
+  const [mode, setMode] = useState<GenMode>('describe')
+  const [description, setDescription] = useState('')
+  const [draft, setDraft] = useState<PolicyDraft | null>(null)
+  const [isSaving, setIsSaving] = useState(false)
   const [error, setError] = useState('')
 
-  const handleSave = async () => {
-    if (!name.trim() || !toolPattern.trim() || !subjectKey.trim() || !subjectType || !edgeType) {
-      setError('Name, tool pattern, subject key, subject type, and edge type are required.')
-      return
-    }
-    const condition: BlockingCondition = {
-      edge_type: edgeType,
-      target_type: targetType || null,
-      blocking_target_states: stateKey.trim()
-        ? { [stateKey.trim()]: stateValues.split(',').map((v) => v.trim()).filter(Boolean) }
-        : {},
-      message_template: messageTemplate,
-    }
-    setBusy(true)
+  const handleGenerate = async () => {
+    if (!description.trim()) return
+    setMode('generating')
     setError('')
     try {
-      await onSave({
-        name: name.trim(),
-        tool_pattern: toolPattern.trim(),
-        subject_key: subjectKey.trim(),
-        subject_type: subjectType,
-        blocking_conditions: [condition],
-        enabled: true,
-      })
+      const result = await generatePolicy(description.trim())
+      setDraft(result as PolicyDraft)
+      setMode('preview')
     } catch (e) {
       setError(String(e))
-      setBusy(false)
+      setMode('describe')
+    }
+  }
+
+  const handleCreate = async () => {
+    if (!draft) return
+    setIsSaving(true)
+    setError('')
+    try {
+      await onSave(draft)
+    } catch (e) {
+      setError(String(e))
+      setIsSaving(false)
     }
   }
 
   return (
     <div style={{ padding: '14px', borderTop: '1px solid var(--color-border)', background: 'var(--color-surface)' }}>
+      <style>{`@keyframes pp-spin { to { transform: rotate(360deg); } }`}</style>
+
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
         <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--color-text)', fontFamily: 'var(--font-sans)' }}>New Policy</span>
         <button onClick={onCancel} style={{ ...btnBase, padding: '2px 6px' }}>Cancel</button>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '10px' }}>
-        <div style={{ gridColumn: '1 / -1' }}>
-          <label style={labelStyle}>Name</label>
-          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Block termination with active projects" style={inputStyle} />
-        </div>
-        <div style={{ gridColumn: '1 / -1' }}>
-          <label style={labelStyle}>Tool pattern (regex)</label>
-          <input value={toolPattern} onChange={(e) => setToolPattern(e.target.value)} placeholder="terminate_employee|fire_employee" style={inputStyle} />
-        </div>
-        <div>
-          <label style={labelStyle}>Subject type</label>
-          <select value={subjectType} onChange={(e) => setSubjectType(e.target.value)} style={{ ...inputStyle, appearance: 'auto' }}>
-            {entityTypes.map((et) => <option key={et.name} value={et.name}>{et.name}</option>)}
-          </select>
-        </div>
-        <div>
-          <label style={labelStyle}>Subject key in tool input</label>
-          <input value={subjectKey} onChange={(e) => setSubjectKey(e.target.value)} placeholder="employee_name" style={inputStyle} />
-        </div>
-      </div>
-
-      <div style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--color-text-dim)', fontFamily: 'var(--font-sans)', marginBottom: '6px' }}>
-        Blocking condition
-      </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '8px' }}>
-        <div>
-          <label style={labelStyle}>Edge type</label>
-          <select value={edgeType} onChange={(e) => setEdgeType(e.target.value)} style={{ ...inputStyle, appearance: 'auto' }}>
-            {edgeTypes.map((et) => <option key={et.name} value={et.name}>{et.name}</option>)}
-          </select>
-        </div>
-        <div>
-          <label style={labelStyle}>Target type (optional)</label>
-          <select value={targetType} onChange={(e) => setTargetType(e.target.value)} style={{ ...inputStyle, appearance: 'auto' }}>
-            <option value="">— any —</option>
-            {entityTypes.map((et) => <option key={et.name} value={et.name}>{et.name}</option>)}
-          </select>
-        </div>
-        <div>
-          <label style={labelStyle}>Blocking state property</label>
-          <input value={stateKey} onChange={(e) => setStateKey(e.target.value)} placeholder="status" style={inputStyle} />
-        </div>
-        <div>
-          <label style={labelStyle}>Blocking values (comma-separated)</label>
-          <input value={stateValues} onChange={(e) => setStateValues(e.target.value)} placeholder="pending, in_progress" style={inputStyle} />
-        </div>
-        <div style={{ gridColumn: '1 / -1' }}>
-          <label style={labelStyle}>Message template</label>
-          <input value={messageTemplate} onChange={(e) => setMessageTemplate(e.target.value)} style={inputStyle} />
-          <div style={{ fontSize: '10px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-sans)', marginTop: '2px' }}>
-            Placeholders: {'{'} subject {'}'} {'{'} count {'}'} {'{'} targets {'}'}
+      {(mode === 'describe' || mode === 'generating') && (
+        <>
+          <div style={{ fontSize: '10px', fontFamily: 'var(--font-mono)', letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--color-text-dim)', marginBottom: '6px' }}>
+            describe the policy
           </div>
-        </div>
-      </div>
+          <textarea
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleGenerate() }}
+            disabled={mode === 'generating'}
+            placeholder="e.g. Block terminating employees who are assigned to active projects"
+            rows={4}
+            style={{
+              fontSize: '12px', fontFamily: 'var(--font-sans)', padding: '8px 10px',
+              borderRadius: 'var(--radius-md)', border: '1px solid var(--color-border)',
+              background: 'var(--color-surface-2)', color: 'var(--color-text)',
+              outline: 'none', width: '100%', boxSizing: 'border-box',
+              resize: 'none', lineHeight: '1.55', marginBottom: '10px',
+              opacity: mode === 'generating' ? 0.6 : 1,
+            }}
+          />
+          {error && (
+            <div style={{ fontSize: '11px', color: '#EF4444', marginBottom: '8px', fontFamily: 'var(--font-sans)' }}>
+              {error}
+            </div>
+          )}
+          <button
+            onClick={handleGenerate}
+            disabled={mode === 'generating' || !description.trim()}
+            style={{
+              ...btnPrimary, width: '100%', padding: '8px',
+              fontSize: '12px', fontWeight: 700,
+              opacity: (mode === 'generating' || !description.trim()) ? 0.45 : 1,
+              cursor: (mode === 'generating' || !description.trim()) ? 'default' : 'pointer',
+            }}
+          >
+            {mode === 'generating' ? (
+              <span style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px' }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', border: '1.5px solid var(--color-accent)', borderTopColor: 'transparent', display: 'inline-block', animation: 'pp-spin 0.7s linear infinite' }} />
+                Generating…
+              </span>
+            ) : 'Generate policy'}
+          </button>
+        </>
+      )}
 
-      {error && <div style={{ fontSize: '11px', color: '#EF4444', marginBottom: '8px', fontFamily: 'var(--font-sans)' }}>{error}</div>}
-
-      <button onClick={handleSave} disabled={busy} style={{ ...btnPrimary, width: '100%' }}>
-        {busy ? 'Creating…' : 'Create Policy'}
-      </button>
+      {mode === 'preview' && draft && (
+        <>
+          <DraftPreview draft={draft} />
+          {error && (
+            <div style={{ fontSize: '11px', color: '#EF4444', marginBottom: '8px', fontFamily: 'var(--font-sans)' }}>
+              {error}
+            </div>
+          )}
+          <div style={{ display: 'flex', gap: '6px' }}>
+            <button
+              onClick={handleCreate}
+              disabled={isSaving}
+              style={{
+                ...btnPrimary, flex: 1, padding: '7px',
+                fontSize: '12px', fontWeight: 700,
+                opacity: isSaving ? 0.45 : 1,
+                cursor: isSaving ? 'default' : 'pointer',
+              }}
+            >
+              {isSaving ? 'Creating…' : 'Create Policy'}
+            </button>
+            <button
+              onClick={() => { setMode('describe'); setError('') }}
+              style={{ ...btnBase, padding: '7px 12px' }}
+            >
+              Back
+            </button>
+          </div>
+        </>
+      )}
     </div>
   )
 }
@@ -235,44 +277,38 @@ export interface PoliciesPanelProps {
   policies: Policy[]
   entityTypes: EntityType[]
   edgeTypes: EdgeType[]
+  tools: ToolDef[]
   onRefresh: () => void
 }
 
-export function PoliciesPanel({ policies, entityTypes, edgeTypes, onRefresh }: PoliciesPanelProps) {
+export function PoliciesPanel({ policies, entityTypes, edgeTypes, tools, onRefresh }: PoliciesPanelProps) {
   const [isAdding, setIsAdding] = useState(false)
   const [error, setError] = useState('')
 
   const handleToggle = async (id: string, enabled: boolean) => {
     setError('')
-    try {
-      await togglePolicy(id, enabled)
-      onRefresh()
-    } catch (e) {
-      setError(String(e))
-    }
+    try { await togglePolicy(id, enabled); onRefresh() } catch (e) { setError(String(e)) }
   }
 
   const handleDelete = async (id: string) => {
     setError('')
-    try {
-      await deletePolicy(id)
-      onRefresh()
-    } catch (e) {
-      setError(String(e))
-    }
+    try { await deletePolicy(id); onRefresh() } catch (e) { setError(String(e)) }
   }
 
-  const handleCreate = async (data: Omit<Policy, 'id' | 'created_at'>) => {
+  const handleCreate = async (draft: PolicyDraft) => {
     await createPolicy({
-      name: data.name,
-      tool_pattern: data.tool_pattern,
-      subject_key: data.subject_key,
-      subject_type: data.subject_type,
-      blocking_conditions: data.blocking_conditions,
+      name: draft.name,
+      tool_pattern: draft.tool_pattern,
+      subject_key: draft.subject_key,
+      subject_type: draft.subject_type,
+      blocking_conditions: draft.blocking_conditions,
     })
     setIsAdding(false)
     onRefresh()
   }
+
+  // Suppress unused-prop warnings — these are passed through for future use
+  void entityTypes; void edgeTypes; void tools
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', background: 'var(--color-bg)', fontFamily: 'var(--font-sans)' }}>
@@ -298,23 +334,18 @@ export function PoliciesPanel({ policies, entityTypes, edgeTypes, onRefresh }: P
             {error}
           </div>
         )}
-
         {policies.length === 0 && !isAdding && (
           <div style={{ textAlign: 'center', color: 'var(--color-text-dim)', fontSize: '13px', marginTop: '40px' }}>
-            No policies yet — add one to enforce graph-based constraints before tool execution.
+            No policies yet — describe one and let AI generate it.
           </div>
         )}
-
         {policies.map((p) => (
           <PolicyCard key={p.id} policy={p} onToggle={handleToggle} onDelete={handleDelete} />
         ))}
       </div>
 
-      {/* Add form pinned to bottom */}
       {isAdding && (
-        <AddPolicyForm
-          entityTypes={entityTypes}
-          edgeTypes={edgeTypes}
+        <GeneratePolicyFlow
           onSave={handleCreate}
           onCancel={() => setIsAdding(false)}
         />
