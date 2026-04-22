@@ -4,6 +4,7 @@ import { BuilderPanel } from './components/builder/BuilderPanel'
 import { SpacePanel } from './components/space/SpacePanel'
 import { OntologyView } from './components/ontology/OntologyView'
 import { PoliciesPanel } from './components/policies/PoliciesPanel'
+import { TopologyPanel } from './components/topology/TopologyPanel'
 import {
   getAgents, getAgentTasks, getTaskMessages,
   getEntities, getEdges, getRuns,
@@ -15,7 +16,7 @@ import type { AgentSpec, Message, Task, Entity, Edge, Run, EntityType, EdgeType,
 import './styles/tokens.css'
 import './App.css'
 
-type Tab = 'workspace' | 'ontology' | 'policies'
+type Tab = 'workspace' | 'ontology' | 'policies' | 'topology'
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('workspace')
@@ -35,18 +36,22 @@ export default function App() {
   const [tools, setTools] = useState<ToolDef[]>([])
   const [isAgentStreaming, setIsAgentStreaming] = useState(false)
 
+  const loadEdges = useCallback(() => {
+    getEdges().then(setEdges).catch(console.error)
+  }, [])
+
   useEffect(() => {
     getAgents().then((loaded) => {
       if (loaded.length > 0) { setAgents(loaded); setSelectedAgentId(loaded[0].id) }
     }).catch(console.error)
     getEntities().then(setEntities).catch(console.error)
-    getEdges().then(setEdges).catch(console.error)
+    loadEdges()
     getEntityTypes().then(setEntityTypes).catch(console.error)
     getEdgeTypes().then(setEdgeTypes).catch(console.error)
     getRuns().then(setRuns).catch(console.error)
     getPolicies().then(setPolicies).catch(console.error)
     getTools().then(setTools).catch(console.error)
-  }, [])
+  }, [loadEdges])
 
   useEffect(() => {
     if (!selectedAgentId) return
@@ -210,6 +215,15 @@ export default function App() {
           edgeTypes={edgeTypes}
           tools={tools}
           onRefresh={() => getPolicies().then(setPolicies).catch(console.error)}
+        />
+      )}
+
+      {tab === 'topology' && (
+        <TopologyPanel
+          agents={agents}
+          edges={edges}
+          edgeTypes={edgeTypes}
+          onEdgesChanged={loadEdges}
         />
       )}
     </div>

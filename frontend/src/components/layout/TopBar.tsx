@@ -1,6 +1,6 @@
 import { useState } from 'react'
 
-type Tab = 'workspace' | 'ontology' | 'policies'
+type Tab = 'workspace' | 'ontology' | 'policies' | 'topology'
 
 interface TopBarProps {
   activeTab: Tab
@@ -11,6 +11,7 @@ const TABS: Array<{ key: Tab; label: string }> = [
   { key: 'workspace', label: 'Workspace' },
   { key: 'ontology', label: 'Ontology' },
   { key: 'policies', label: 'Policies' },
+  { key: 'topology', label: 'Topology' },
 ]
 
 export function TopBar({ activeTab, onTabChange }: TopBarProps) {
@@ -96,11 +97,6 @@ export function TopBar({ activeTab, onTabChange }: TopBarProps) {
         ))}
       </nav>
 
-      {/* Status indicator */}
-      <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: '6px' }}>
-        <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--color-success)', display: 'inline-block', boxShadow: '0 0 6px var(--color-success)' }} />
-        <span style={{ fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--color-text-dim)', letterSpacing: '0.05em' }}>live</span>
-      </div>
     </header>
   )
 }
