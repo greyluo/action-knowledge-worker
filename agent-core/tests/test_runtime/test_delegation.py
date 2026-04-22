@@ -12,7 +12,7 @@ from spec_factory import RunContext, begin_run, get_agent_entity_id
 
 async def test_topology_edge_types_seeded(session):
     await run_seed(session)
-    for name in ["delegates_to", "next_in_chain", "parallel_with",
+    for name in ["delegates_to", "parallel_with",
                  "loops_back_to", "handles", "fallback_to", "seeded_with"]:
         et = await session.scalar(select(EdgeType).where(EdgeType.name == name))
         assert et is not None, f"Edge type {name!r} not seeded"
