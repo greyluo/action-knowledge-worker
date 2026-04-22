@@ -21,6 +21,7 @@ from sqlalchemy import delete as sql_delete, select  # noqa: E402
 
 from db import (  # noqa: E402
     AgentSpec as DbAgentSpec,
+    Delegation as DbDelegation,
     Edge as DbEdge,
     EdgeType as DbEdgeType,
     Entity as DbEntity,
@@ -29,6 +30,7 @@ from db import (  # noqa: E402
     OntologyType as DbOntologyType,
     PolicyRule as DbPolicyRule,
     Run as DbRun,
+    ToolCall as DbToolCall,
     db_session,
 )
 
@@ -246,6 +248,29 @@ async def list_runs():
         ]
 
 
+@app.get("/delegations")
+async def list_delegations(run_id: str | None = None):
+    async with db_session() as session:
+        query = select(DbDelegation)
+        if run_id:
+            query = query.where(DbDelegation.parent_run_id == uuid.UUID(run_id))
+        rows = (await session.execute(query.order_by(DbDelegation.created_at))).scalars().all()
+        return [
+            {
+                "id": str(d.id),
+                "parent_run_id": str(d.parent_run_id),
+                "child_run_id": str(d.child_run_id) if d.child_run_id else None,
+                "task_entity_id": str(d.task_entity_id) if d.task_entity_id else None,
+                "to_agent_spec_id": str(d.to_agent_spec_id),
+                "status": d.status,
+                "context_ids": d.context_ids or [],
+                "created_at": d.created_at.isoformat(),
+                "completed_at": d.completed_at.isoformat() if d.completed_at else None,
+            }
+            for d in rows
+        ]
+
+
 @app.get("/schema/entity-types")
 async def list_entity_types():
     async with db_session() as session:
@@ -255,9 +280,40 @@ async def list_entity_types():
                 "name": t.name,
                 "canonical_key": t.canonical_key,
                 "description": t.description if hasattr(t, "description") else None,
+                "fields": t.fields or {},
             }
             for t in types
         ]
+
+
+@app.get("/tools")
+async def list_tools():
+    """Return all tools known to the system with their string-typed parameter names."""
+    from mock_tools import (  # noqa: PLC0415
+        fetch_company_data, fetch_email_thread, terminate_employee,
+        remember_entity, query_graph_tool,
+    )
+    demo_tools = [fetch_company_data, fetch_email_thread, terminate_employee, remember_entity, query_graph_tool]
+    tool_map = {
+        f"mcp__demo__{t.name}": [k for k, v in t.input_schema.items() if v is str]
+        for t in demo_tools
+    }
+
+    async with db_session() as session:
+        specs = (await session.execute(select(DbAgentSpec))).scalars().all()
+        result = []
+        seen: set[str] = set()
+        for spec in specs:
+            for tool_name in (spec.allowed_tools or []):
+                if tool_name not in seen:
+                    seen.add(tool_name)
+                    params = tool_map.get(tool_name, [])
+                    # Only include tools that have known parameters — skip bare
+                    # capability tools (Read, Write, Bash, etc.) which have no
+                    # relevant entity identifier parameter.
+                    if params or tool_name in tool_map:
+                        result.append({"name": tool_name, "parameters": params})
+    return result
 
 
 class CreateEntityTypeRequest(BaseModel):
@@ -426,6 +482,63 @@ async def get_run_events(run_id: str):
         ]
 
 
+@app.get("/runs/{run_id}/trace")
+async def get_run_trace(run_id: str):
+    rid = uuid.UUID(run_id)
+    async with db_session() as session:
+        wrote = (
+            await session.execute(
+                select(DbEntity, DbOntologyType)
+                .join(DbOntologyType, DbEntity.type_id == DbOntologyType.id)
+                .where(DbEntity.created_in_run_id == rid)
+            )
+        ).all()
+
+        tool_calls = (
+            await session.execute(
+                select(DbToolCall)
+                .where(DbToolCall.run_id == rid)
+                .order_by(DbToolCall.created_at)
+            )
+        ).scalars().all()
+
+        delegations = (
+            await session.execute(
+                select(DbDelegation).where(DbDelegation.parent_run_id == rid)
+            )
+        ).scalars().all()
+
+        return {
+            "run_id": run_id,
+            "wrote": [
+                {
+                    "id": str(e.id),
+                    "type": ot.name,
+                    "name": _entity_display_name(e.properties or {}, e.id),
+                    "properties": e.properties or {},
+                }
+                for e, ot in wrote
+            ],
+            "tool_calls": [
+                {
+                    "tool": tc.tool_name,
+                    "args": tc.tool_input or {},
+                    "created_at": tc.created_at.isoformat(),
+                }
+                for tc in tool_calls
+            ],
+            "delegations": [
+                {
+                    "id": str(d.id),
+                    "to_agent_spec_id": str(d.to_agent_spec_id),
+                    "status": d.status,
+                    "task_entity_id": str(d.task_entity_id) if d.task_entity_id else None,
+                }
+                for d in delegations
+            ],
+        }
+
+
 # ---------------------------------------------------------------------------
 # /chat SSE endpoint
 # ---------------------------------------------------------------------------
@@ -462,6 +575,7 @@ async def chat(body: ChatRequest):
     async def run_agent():
         try:
             from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock, query
+            from claude_agent_sdk.types import ResultMessage
             from spec_factory import begin_run, build_options_from_spec, end_run, get_agent_entity_id, load_spec
 
             async with db_session() as session:
@@ -470,15 +584,33 @@ async def chat(body: ChatRequest):
                 task_uuid = uuid.UUID(body.task_id) if body.task_id else None
                 run_ctx = await begin_run(session, body.message, spec, agent_entity_id, task_id=task_uuid)
 
+                # Find the most recent session_id for this task to resume conversation history
+                prior_session_id: str | None = None
+                if task_uuid:
+                    prior_run = await session.scalar(
+                        select(DbRun)
+                        .where(
+                            DbRun.in_service_of_task_id == task_uuid,
+                            DbRun.session_id.isnot(None),
+                            DbRun.id != run_ctx.run_id,
+                        )
+                        .order_by(DbRun.started_at.desc())
+                        .limit(1)
+                    )
+                    if prior_run:
+                        prior_session_id = prior_run.session_id
+
             streaming_hook = await _make_streaming_hook(queue)
 
             options = build_options_from_spec(
                 spec, run_ctx,
                 streaming_hook=streaming_hook,
                 permission_mode="bypassPermissions",
+                resume_session_id=prior_session_id,
             )
 
             sdk_messages = []
+            new_session_id: str | None = None
             async for sdk_msg in query(prompt=body.message, options=options):
                 sdk_messages.append(sdk_msg)
                 if isinstance(sdk_msg, AssistantMessage):
@@ -487,6 +619,8 @@ async def chat(body: ChatRequest):
                     ).strip()
                     if text:
                         await queue.put(("message", {"role": "agent", "content": text}))
+                elif isinstance(sdk_msg, ResultMessage):
+                    new_session_id = sdk_msg.session_id
 
             async with db_session() as session:
                 session.add(
@@ -515,6 +649,10 @@ async def chat(body: ChatRequest):
                             )
                         )
                 await end_run(session, run_ctx, sdk_messages)
+                if new_session_id:
+                    run = await session.get(DbRun, run_ctx.run_id)
+                    if run:
+                        run.session_id = new_session_id
 
             await queue.put(
                 ("done", {"run_id": str(run_ctx.run_id), "task_id": str(run_ctx.task_id)})
@@ -572,7 +710,7 @@ def _spec_to_dict(spec: DbAgentSpec) -> dict:
 
 @app.post("/agents")
 async def create_agent(body: CreateAgentRequest):
-    from builder_agent import capabilities_to_tools
+    from builder_agent import capabilities_to_tools, sync_agent_to_ontology  # noqa: PLC0415
     tools = capabilities_to_tools(body.capabilities)
     async with db_session() as session:
         spec = DbAgentSpec(
@@ -584,7 +722,11 @@ async def create_agent(body: CreateAgentRequest):
         )
         session.add(spec)
         await session.flush()
-        return _spec_to_dict(spec)
+        result = _spec_to_dict(spec)
+        spec_id = spec.id
+
+    asyncio.create_task(sync_agent_to_ontology(spec_id, body.name, body.system_prompt))
+    return result
 
 
 class UpdateAgentRequest(BaseModel):
@@ -595,7 +737,7 @@ class UpdateAgentRequest(BaseModel):
 
 @app.patch("/agents/{agent_id}")
 async def update_agent(agent_id: str, body: UpdateAgentRequest):
-    from builder_agent import capabilities_to_tools
+    from builder_agent import capabilities_to_tools, sync_agent_to_ontology  # noqa: PLC0415
     async with db_session() as session:
         spec = await session.get(DbAgentSpec, uuid.UUID(agent_id))
         if not spec:
@@ -607,7 +749,11 @@ async def update_agent(agent_id: str, body: UpdateAgentRequest):
         if body.capabilities is not None:
             spec.allowed_tools = capabilities_to_tools(body.capabilities)
         await session.flush()
-        return _spec_to_dict(spec)
+        result = _spec_to_dict(spec)
+        spec_id, final_name, final_prompt = spec.id, spec.name, spec.system_prompt
+
+    asyncio.create_task(sync_agent_to_ontology(spec_id, final_name, final_prompt))
+    return result
 
 
 @app.delete("/agents/{agent_id}", status_code=204)
@@ -641,6 +787,23 @@ async def list_policies():
     async with db_session() as session:
         rows = (await session.execute(select(DbPolicyRule).order_by(DbPolicyRule.created_at))).scalars().all()
         return [_policy_row(r) for r in rows]
+
+
+class GeneratePolicyRequest(BaseModel):
+    description: str
+
+
+@app.post("/policies/generate")
+async def generate_policy_endpoint(body: GeneratePolicyRequest):
+    from policy_builder import generate_policy  # noqa: PLC0415
+
+    tools = await list_tools()
+    async with db_session() as session:
+        entity_type_rows = (await session.execute(select(DbOntologyType))).scalars().all()
+        edge_type_rows = (await session.execute(select(DbEdgeType))).scalars().all()
+    entity_types = [{"name": t.name} for t in entity_type_rows]
+    edge_types = [{"name": t.name} for t in edge_type_rows]
+    return await generate_policy(body.description, tools, entity_types, edge_types)
 
 
 class BlockingConditionModel(BaseModel):
