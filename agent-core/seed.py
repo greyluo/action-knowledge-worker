@@ -115,6 +115,12 @@ SEED_ENTITY_TYPES = [
         "from_agent": "str", "to_agent": "str",
         "summary": "str", "key_entity_ids": "list",
     }, "canonical_key": None, "description": "Cover note passed between agents at delegation time"},
+    {"name": "Book", "parent_name": "Entity", "fields": {
+        "title": "str", "author": "str", "isbn": "str", "status": "str",
+    }, "canonical_key": "isbn", "description": "A book in the library system"},
+    {"name": "Permission", "parent_name": "Entity", "fields": {
+        "resource_type": "str", "access_level": "str",
+    }, "canonical_key": "resource_type", "description": "An access grant for a resource type; agents with a has_permission edge to this entity may access that resource"},
 ]
 
 SEED_EDGE_TYPES = [
@@ -132,10 +138,10 @@ SEED_EDGE_TYPES = [
     {"name": "has_assignee", "is_transitive": False, "is_inverse_of": "assigned_to"},
     # Multi-agent topology edges
     {"name": "delegates_to", "is_transitive": False, "is_inverse_of": None},
-    {"name": "next_in_chain", "is_transitive": False, "is_inverse_of": None},
     {"name": "parallel_with", "is_transitive": False, "is_inverse_of": None},
     {"name": "loops_back_to", "is_transitive": False, "is_inverse_of": None},
     {"name": "handles", "is_transitive": False, "is_inverse_of": None},
+    {"name": "has_permission", "is_transitive": False, "is_inverse_of": None},
     {"name": "fallback_to", "is_transitive": False, "is_inverse_of": None},
     {"name": "seeded_with", "is_transitive": False, "is_inverse_of": None},
 ]
@@ -239,7 +245,25 @@ _SEED_POLICIES = [
                 ),
             }
         ],
-    }
+    },
+    {
+        "name": "library_system_book_access_control",
+        "tool_pattern": r"query_graph",
+        "tool_input_filter": {"entity_type": "Book"},
+        "subject_source": "actor",
+        "blocking_conditions": [
+            {
+                "edge_type": "has_permission",
+                "target_type": "Permission",
+                "blocking_target_states": {"resource_type": ["Book"]},
+                "invert": True,
+                "message_template": (
+                    "{subject} does not have permission to access Book resources. "
+                    "Only agents granted library access may query the book catalogue."
+                ),
+            }
+        ],
+    },
 ]
 
 
@@ -252,8 +276,10 @@ async def _seed_policies(session: AsyncSession) -> None:
             session.add(PolicyRule(
                 name=p["name"],
                 tool_pattern=p["tool_pattern"],
-                subject_key=p["subject_key"],
-                subject_type=p["subject_type"],
+                subject_key=p.get("subject_key", ""),
+                subject_type=p.get("subject_type", ""),
+                subject_source=p.get("subject_source", "tool_input"),
+                tool_input_filter=p.get("tool_input_filter"),
                 blocking_conditions=p["blocking_conditions"],
                 enabled=True,
             ))
