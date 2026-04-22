@@ -12,6 +12,8 @@ import uuid as _uuid_mod
 from datetime import datetime, timezone
 from typing import Any
 
+_background_tasks: set[asyncio.Task] = set()
+
 from claude_agent_sdk import ToolAnnotations, create_sdk_mcp_server, tool
 
 # ---------------------------------------------------------------------------
@@ -381,6 +383,9 @@ async def _delegate_task_impl(args: dict, run_ctx, *, _session=None) -> dict:
         task_type = await session.scalar(
             _select(OntologyType).where(OntologyType.name == "Task")
         )
+        if not task_type:
+            return {"error": "Task ontology type not found — run seed first"}
+
         part_of_et = await session.scalar(
             _select(EdgeType).where(EdgeType.name == "part_of")
         )
@@ -467,6 +472,7 @@ async def _delegate_task_impl(args: dict, run_ctx, *, _session=None) -> dict:
         await session.flush()
         delegation_id = delegation.id
         child_task_id = child_task.id
+        delegation.status = "running"
 
     if execution_mode == "wait":
         return await _run_child_agent(
@@ -474,12 +480,14 @@ async def _delegate_task_impl(args: dict, run_ctx, *, _session=None) -> dict:
             run_ctx.run_id, delegation_id, context_entity_ids,
         )
     else:
-        asyncio.create_task(
+        _task = asyncio.create_task(
             _run_child_agent(
                 to_agent_spec_id, task_prompt, child_task_id,
                 run_ctx.run_id, delegation_id, context_entity_ids,
             )
         )
+        _background_tasks.add(_task)
+        _task.add_done_callback(_background_tasks.discard)
         return {
             "delegation_id": str(delegation_id),
             "task_entity_id": str(child_task_id),
@@ -512,6 +520,7 @@ def make_demo_server(run_ctx=None):
                 "execution_mode": str,
                 "handoff_summary": str,
             },
+            annotations=ToolAnnotations(readOnlyHint=False),
         )
         async def delegate_task_tool(args: dict) -> dict:
             result = await _delegate_task_impl(args, run_ctx)

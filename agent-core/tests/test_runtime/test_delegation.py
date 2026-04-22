@@ -164,7 +164,7 @@ async def test_delegate_task_creates_delegation_row(two_agent_setup, session):
         )
 
     assert "delegation_id" in result
-    assert result["status"] in ("running", "completed", "pending")
+    assert result["status"] == "running"
 
     delegation = await session.get(Delegation, uuid.UUID(result["delegation_id"]))
     assert delegation is not None
