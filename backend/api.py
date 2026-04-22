@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
-from sqlalchemy import delete as sql_delete, select  # noqa: E402
+from sqlalchemy import delete as sql_delete, select, update as sql_update  # noqa: E402
 
 from db import (  # noqa: E402
     AgentSpec as DbAgentSpec,
@@ -156,16 +156,20 @@ async def get_messages(task_id: str):
 async def delete_task(task_id: str):
     async with db_session() as session:
         tid = uuid.UUID(task_id)
-        # Delete messages and runs
         runs = (await session.execute(select(DbRun).where(DbRun.in_service_of_task_id == tid))).scalars().all()
+        run_ids = [r.id for r in runs]
+        if run_ids:
+            await session.execute(sql_update(DbEntity).where(DbEntity.created_in_run_id.in_(run_ids)).values(created_in_run_id=None))
+            await session.execute(sql_update(DbEdge).where(DbEdge.created_in_run_id.in_(run_ids)).values(created_in_run_id=None))
+            await session.execute(sql_delete(DbToolCall).where(DbToolCall.run_id.in_(run_ids)))
+            await session.execute(sql_delete(DbMessage).where(DbMessage.run_id.in_(run_ids)))
         for run in runs:
-            await session.execute(sql_delete(DbMessage).where(DbMessage.run_id == run.id))
             await session.delete(run)
         await session.flush()
-        # Delete edges referencing the task entity
+        # Clear delegation references before deleting the task entity
+        await session.execute(sql_update(DbDelegation).where(DbDelegation.task_entity_id == tid).values(task_entity_id=None))
         await session.execute(sql_delete(DbEdge).where(DbEdge.src_id == tid))
         await session.execute(sql_delete(DbEdge).where(DbEdge.dst_id == tid))
-        # Delete the task entity itself
         task = await session.get(DbEntity, tid)
         if task:
             await session.delete(task)
@@ -345,6 +349,7 @@ async def list_edge_types():
                 "is_inverse_of": t.is_inverse_of,
                 "domain": t.domain,
                 "range": t.range_,
+                "synonyms": t.synonyms or [],
             }
             for t in types
         ]
@@ -759,9 +764,19 @@ async def update_agent(agent_id: str, body: UpdateAgentRequest):
 @app.delete("/agents/{agent_id}", status_code=204)
 async def delete_agent(agent_id: str):
     async with db_session() as session:
-        spec = await session.get(DbAgentSpec, uuid.UUID(agent_id))
+        aid = uuid.UUID(agent_id)
+        spec = await session.get(DbAgentSpec, aid)
         if not spec:
             raise HTTPException(status_code=404, detail="Agent not found")
+        run_ids_q = select(DbRun.id).where(DbRun.spec_id == aid)
+        run_ids = (await session.execute(run_ids_q)).scalars().all()
+        if run_ids:
+            await session.execute(sql_update(DbEntity).where(DbEntity.created_in_run_id.in_(run_ids)).values(created_in_run_id=None))
+            await session.execute(sql_update(DbEdge).where(DbEdge.created_in_run_id.in_(run_ids)).values(created_in_run_id=None))
+            await session.execute(sql_delete(DbToolCall).where(DbToolCall.run_id.in_(run_ids)))
+            await session.execute(sql_delete(DbMessage).where(DbMessage.run_id.in_(run_ids)))
+        await session.execute(sql_delete(DbDelegation).where(DbDelegation.to_agent_spec_id == aid))
+        await session.execute(sql_delete(DbRun).where(DbRun.spec_id == aid))
         await session.delete(spec)
 
 
@@ -811,13 +826,16 @@ class BlockingConditionModel(BaseModel):
     target_type: str | None = None
     blocking_target_states: dict[str, list[Any]] = {}
     message_template: str = "{subject} has active {edge_type} relationship(s)"
+    invert: bool = False
 
 
 class CreatePolicyRequest(BaseModel):
     name: str
     tool_pattern: str
-    subject_key: str
-    subject_type: str
+    subject_key: str = ""
+    subject_type: str = ""
+    subject_source: str = "tool_input"
+    tool_input_filter: dict[str, Any] | None = None
     blocking_conditions: list[BlockingConditionModel] = []
 
 
@@ -829,6 +847,8 @@ async def create_policy(body: CreatePolicyRequest):
             tool_pattern=body.tool_pattern,
             subject_key=body.subject_key,
             subject_type=body.subject_type,
+            subject_source=body.subject_source,
+            tool_input_filter=body.tool_input_filter,
             blocking_conditions=[c.model_dump() for c in body.blocking_conditions],
             enabled=True,
         )

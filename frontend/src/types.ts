@@ -90,6 +90,7 @@ export interface BlockingCondition {
   target_type: string | null
   blocking_target_states: Record<string, string[]>
   message_template: string
+  invert: boolean
 }
 
 export interface Policy {
@@ -98,6 +99,7 @@ export interface Policy {
   tool_pattern: string
   subject_key: string
   subject_type: string
+  subject_source: string
   blocking_conditions: BlockingCondition[]
   enabled: boolean
   created_at: string

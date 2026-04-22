@@ -172,6 +172,7 @@ export async function generatePolicy(description: string): Promise<{
   tool_pattern: string
   subject_key: string
   subject_type: string
+  subject_source: string
   blocking_conditions: BlockingCondition[]
 }> {
   const res = await fetch(`${BASE}/policies/generate`, {
