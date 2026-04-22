@@ -20,7 +20,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from db import Edge, EdgeType, Entity, OntologyType, PolicyRule, db_session
 
@@ -29,20 +29,35 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GraphCondition:
-    """Block the action if subject entity has a matching edge to a target in a blocking state."""
+    """Block the action if subject entity has (or lacks) a matching edge.
+
+    invert=False (default): block when a matching edge IS found (e.g. "don't fire Alex
+    while he's on an active project").
+    invert=True: block when no matching edge is found (e.g. "deny access unless the
+    calling agent has a 'handles' edge to the requested resource type").
+    """
     edge_type: str
     target_type: str | None = None
     blocking_target_states: dict[str, list[Any]] = field(default_factory=dict)
     message_template: str = "{subject} has active {edge_type} relationship(s)"
+    invert: bool = False
 
 
 @dataclass
 class ActionPolicy:
-    """Maps a tool name pattern to blocking graph conditions."""
+    """Maps a tool name pattern to blocking graph conditions.
+
+    subject_source="tool_input" (default): the subject entity is looked up by the value
+    of tool_input[subject_key] (original behaviour).
+    subject_source="actor": the subject is the agent making the call (run_ctx.agent_entity_id).
+    subject_key and subject_type are ignored when subject_source="actor".
+    """
     tool_pattern: str
-    subject_key: str        # key in tool_input that names the subject entity
-    subject_type: str       # ontology type to search
+    subject_key: str
+    subject_type: str
     blocking_conditions: list[GraphCondition] = field(default_factory=list)
+    subject_source: str = "tool_input"
+    tool_input_filter: dict[str, Any] | None = None
 
 
 def _row_to_policy(row: PolicyRule) -> ActionPolicy:
@@ -52,6 +67,7 @@ def _row_to_policy(row: PolicyRule) -> ActionPolicy:
             target_type=c.get("target_type"),
             blocking_target_states=c.get("blocking_target_states", {}),
             message_template=c.get("message_template", "{subject} has active {edge_type} relationship(s)"),
+            invert=bool(c.get("invert", False)),
         )
         for c in (row.blocking_conditions or [])
     ]
@@ -60,6 +76,8 @@ def _row_to_policy(row: PolicyRule) -> ActionPolicy:
         subject_key=row.subject_key,
         subject_type=row.subject_type,
         blocking_conditions=conditions,
+        subject_source=row.subject_source or "tool_input",
+        tool_input_filter=row.tool_input_filter or None,
     )
 
 
@@ -68,39 +86,43 @@ async def check_policies(
     tool_input: dict[str, Any],
     run_ctx,
 ) -> str | None:
-    """Return a blocking reason if any policy applies, else None."""
-    try:
-        async with db_session() as session:
-            rows = (
-                await session.execute(
-                    select(PolicyRule).where(PolicyRule.enabled == True)  # noqa: E712
-                )
-            ).scalars().all()
+    """Return a blocking reason if any policy applies, else None.
 
-            for row in rows:
-                if not re.search(row.tool_pattern, tool_name, re.IGNORECASE):
-                    continue
+    Raises on infrastructure failure — callers must treat exceptions as deny.
+    """
+    async with db_session() as session:
+        rows = (
+            await session.execute(
+                select(PolicyRule).where(PolicyRule.enabled == True)  # noqa: E712
+            )
+        ).scalars().all()
 
+        for row in rows:
+            if not re.search(row.tool_pattern, tool_name, re.IGNORECASE):
+                continue
+
+            policy = _row_to_policy(row)
+
+            if policy.tool_input_filter and not all(
+                str(tool_input.get(k, "")).lower() == str(v).lower()
+                for k, v in policy.tool_input_filter.items()
+            ):
+                continue
+
+            if policy.subject_source == "actor":
+                subject = await session.get(Entity, run_ctx.agent_entity_id)
+            else:
                 subject_value = tool_input.get(row.subject_key)
                 if not subject_value:
                     continue
-
-                policy = _row_to_policy(row)
                 subject = await _find_entity(session, policy.subject_type, str(subject_value))
-                if not subject:
-                    continue
+            if not subject:
+                continue
 
-                for cond in policy.blocking_conditions:
-                    try:
-                        reason = await _check_condition(session, subject, cond)
-                    except Exception as exc:
-                        logger.exception("policy graph query failed for %s: %s", tool_name, exc)
-                        continue
-                    if reason:
-                        return reason
-
-    except Exception as exc:
-        logger.exception("policy check failed for tool %s: %s", tool_name, exc)
+            for cond in policy.blocking_conditions:
+                reason = await _check_condition(session, subject, cond)
+                if reason:
+                    return reason
 
     return None
 
@@ -112,7 +134,7 @@ async def _find_entity(session, type_name: str, name_value: str) -> "Entity | No
     entity = await session.scalar(
         select(Entity).where(
             Entity.type_id == ot.id,
-            Entity.properties["name"].astext == name_value,
+            func.lower(Entity.properties["name"].astext) == name_value.lower(),
         )
     )
     return entity
@@ -154,14 +176,21 @@ async def _check_condition(session, subject: "Entity", cond: GraphCondition) -> 
             label = props.get("name") or props.get("title") or str(target.id)[:8]
             blocking_targets.append(label)
 
-    if not blocking_targets:
-        return None
-
     subject_name = (subject.properties or {}).get("name", str(subject.id)[:8])
-    return (
-        cond.message_template
-        .replace("{subject}", subject_name)
-        .replace("{edge_type}", cond.edge_type)
-        .replace("{count}", str(len(blocking_targets)))
-        .replace("{targets}", ", ".join(f'"{t}"' for t in blocking_targets))
-    )
+
+    def _render(targets: list[str]) -> str:
+        return (
+            cond.message_template
+            .replace("{subject}", subject_name)
+            .replace("{edge_type}", cond.edge_type)
+            .replace("{count}", str(len(targets)))
+            .replace("{targets}", ", ".join(f'"{t}"' for t in targets))
+        )
+
+    if cond.invert:
+        # Block when the edge is ABSENT (permission-check mode)
+        return None if blocking_targets else _render([])
+    else:
+        # Block when the edge IS present (harm-prevention mode)
+        return _render(blocking_targets) if blocking_targets else None
+
