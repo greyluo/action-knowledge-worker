@@ -105,6 +105,7 @@ class EdgeType(Base):
     is_inverse_of: Mapped[str | None] = mapped_column(String, nullable=True)
     domain: Mapped[str | None] = mapped_column(String, nullable=True)
     range_: Mapped[str | None] = mapped_column(String, nullable=True)
+    synonyms: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
