@@ -1,12 +1,17 @@
 """query_graph tool — the agent's read path into the ontology."""
+import logging
 import uuid
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import rules as _rules
 from db import Edge, EdgeType, Entity, OntologyEvent, OntologyType, db_session
+
+logger = logging.getLogger(__name__)
+
+_TRGM_THRESHOLD = 0.3
 
 _SYSTEM_TYPE_NAMES = frozenset({"Entity", "Agent", "Run", "Task"})
 
@@ -90,9 +95,9 @@ async def _query(
     if related_to:
         from_id = uuid.UUID(related_to)
         entity_ids = await _reachable_ids(session, from_id, et_ids, max_hops)
-        entity_rows = await _fetch_entities(session, entity_ids, type_ids, properties)
+        entity_rows, match_quality = await _fuzzy_fetch_entities(session, entity_ids, type_ids, properties)
     else:
-        entity_rows = await _filtered_entities(session, type_ids, properties)
+        entity_rows, match_quality = await _fuzzy_filtered_entities(session, type_ids, properties)
         entity_ids = {e.id for e in entity_rows}
 
     if not entity_ids:
@@ -107,7 +112,7 @@ async def _query(
     type_name_map = await _load_type_names(session, {e.type_id for e in entity_rows})
 
     stored_edges = await _edges_among(session, entity_ids, et_ids)
-    entities_out = _serialize_entities(entity_rows, type_name_map)
+    entities_out = _serialize_entities(entity_rows, type_name_map, match_quality)
     edges_out = _serialize_stored_edges(stored_edges, et_name_map)
 
     if apply_inference and entity_ids:
@@ -239,35 +244,69 @@ async def _reachable_ids(
 # ---------------------------------------------------------------------------
 
 
-async def _filtered_entities(
+async def _apply_property_tier(
+    q, properties: dict, tier: str
+):
+    """Return query with property filters for the given tier."""
+    for k, v in properties.items():
+        col = Entity.properties[k].astext
+        sv = str(v)
+        if tier == "exact":
+            q = q.where(col.ilike(sv))
+        elif tier == "partial":
+            q = q.where(col.ilike(f"%{sv}%"))
+        else:  # fuzzy
+            q = q.where(func.similarity(col, sv) > _TRGM_THRESHOLD)
+    return q
+
+
+async def _fuzzy_filtered_entities(
     session: AsyncSession,
     type_ids: list[uuid.UUID] | None,
     properties: dict | None,
-) -> list[Entity]:
-    q = select(Entity)
+) -> tuple[list[Entity], str | None]:
+    base = select(Entity)
     if type_ids is not None:
-        q = q.where(Entity.type_id.in_(type_ids))
-    if properties:
-        for k, v in properties.items():
-            q = q.where(Entity.properties[k].astext == str(v))
-    return list((await session.execute(q)).scalars().all())
+        base = base.where(Entity.type_id.in_(type_ids))
+    if not properties:
+        return list((await session.execute(base)).scalars().all()), None
+
+    for tier in ("exact", "partial", "fuzzy"):
+        try:
+            q = await _apply_property_tier(base, properties, tier)
+            rows = list((await session.execute(q)).scalars().all())
+            if rows:
+                return rows, tier
+        except Exception as e:
+            logger.warning("query_graph tier %s failed: %s", tier, e)
+            break
+    return [], "fuzzy"
 
 
-async def _fetch_entities(
+async def _fuzzy_fetch_entities(
     session: AsyncSession,
     entity_ids: set[uuid.UUID],
     type_ids: list[uuid.UUID] | None,
     properties: dict | None,
-) -> list[Entity]:
+) -> tuple[list[Entity], str | None]:
     if not entity_ids:
-        return []
-    q = select(Entity).where(Entity.id.in_(entity_ids))
+        return [], None
+    base = select(Entity).where(Entity.id.in_(entity_ids))
     if type_ids is not None:
-        q = q.where(Entity.type_id.in_(type_ids))
-    if properties:
-        for k, v in properties.items():
-            q = q.where(Entity.properties[k].astext == str(v))
-    return list((await session.execute(q)).scalars().all())
+        base = base.where(Entity.type_id.in_(type_ids))
+    if not properties:
+        return list((await session.execute(base)).scalars().all()), None
+
+    for tier in ("exact", "partial", "fuzzy"):
+        try:
+            q = await _apply_property_tier(base, properties, tier)
+            rows = list((await session.execute(q)).scalars().all())
+            if rows:
+                return rows, tier
+        except Exception as e:
+            logger.warning("query_graph tier %s failed: %s", tier, e)
+            break
+    return [], "fuzzy"
 
 
 async def _edges_among(
@@ -382,10 +421,11 @@ def _attach_relationships(
 
 
 def _serialize_entities(
-    rows: list[Entity], type_name_map: dict[uuid.UUID, str]
+    rows: list[Entity],
+    type_name_map: dict[uuid.UUID, str],
+    match_quality: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Serialize Entity ORM rows to dicts, resolving type names from the pre-built map."""
-    return [
+    out = [
         {
             "id": str(e.id),
             "type": type_name_map.get(e.type_id, str(e.type_id)),
@@ -394,6 +434,10 @@ def _serialize_entities(
         }
         for e in rows
     ]
+    if match_quality is not None:
+        for entity in out:
+            entity["match_quality"] = match_quality
+    return out
 
 
 def _serialize_stored_edges(
