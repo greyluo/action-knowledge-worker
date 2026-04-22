@@ -1,4 +1,4 @@
-import type { AgentSpec, Entity, Edge, Run, OntologyEvent, Task, Message, EntityType, EdgeType, Policy, BlockingCondition } from './types'
+import type { AgentSpec, Entity, Edge, Run, OntologyEvent, Task, Message, EntityType, EdgeType, Policy, BlockingCondition, ToolDef, Delegation, RunTrace } from './types'
 
 const BASE = 'http://localhost:8001'
 
@@ -18,6 +18,7 @@ export const getRuns = (): Promise<Run[]> => get('/runs')
 export const getRunEvents = (runId: string): Promise<OntologyEvent[]> => get(`/runs/${runId}/events`)
 export const getEntityTypes = (): Promise<EntityType[]> => get('/schema/entity-types')
 export const getEdgeTypes = (): Promise<EdgeType[]> => get('/schema/edge-types')
+export const getTools = (): Promise<ToolDef[]> => get('/tools')
 
 export interface ChatCallbacks {
   onToolCall?: (tool: string, args: Record<string, unknown>) => void
@@ -159,6 +160,28 @@ export async function deleteEdge(id: string): Promise<void> {
 }
 
 export const getPolicies = (): Promise<Policy[]> => get('/policies')
+
+export const getDelegations = (runId?: string): Promise<Delegation[]> =>
+  get(`/delegations${runId ? `?run_id=${runId}` : ''}`)
+
+export const getRunTrace = (runId: string): Promise<RunTrace> =>
+  get(`/runs/${runId}/trace`)
+
+export async function generatePolicy(description: string): Promise<{
+  name: string
+  tool_pattern: string
+  subject_key: string
+  subject_type: string
+  blocking_conditions: BlockingCondition[]
+}> {
+  const res = await fetch(`${BASE}/policies/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ description }),
+  })
+  if (!res.ok) throw new Error(`Generate policy failed: ${res.status}`)
+  return res.json()
+}
 
 export async function createPolicy(data: {
   name: string

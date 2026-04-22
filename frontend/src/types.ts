@@ -59,6 +59,12 @@ export interface EntityType {
   name: string
   canonical_key: string | null
   description: string | null
+  fields: Record<string, string>
+}
+
+export interface ToolDef {
+  name: string
+  parameters: string[]
 }
 
 export interface EdgeType {
@@ -95,4 +101,41 @@ export interface Policy {
   blocking_conditions: BlockingCondition[]
   enabled: boolean
   created_at: string
+}
+
+export interface Delegation {
+  id: string
+  parent_run_id: string
+  child_run_id: string | null
+  task_entity_id: string | null
+  to_agent_spec_id: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  context_ids: string[]
+  created_at: string
+  completed_at: string | null
+}
+
+export interface TraceToolCall {
+  tool: string
+  args: Record<string, unknown>
+  created_at: string
+}
+
+export interface TraceEntity {
+  id: string
+  type: string
+  name: string
+  properties: Record<string, unknown>
+}
+
+export interface RunTrace {
+  run_id: string
+  wrote: TraceEntity[]
+  tool_calls: TraceToolCall[]
+  delegations: Array<{
+    id: string
+    to_agent_spec_id: string
+    status: string
+    task_entity_id: string | null
+  }>
 }
