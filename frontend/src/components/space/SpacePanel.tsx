@@ -5,6 +5,7 @@ import { getDelegations } from '../../api'
 
 interface SpacePanelProps {
   agent: AgentSpec | undefined
+  agents: AgentSpec[]
   tasks: Task[]
   selectedTaskId: string
   messages: Message[]
@@ -13,6 +14,7 @@ interface SpacePanelProps {
   currentRunId?: string
   onTaskSelect: (id: string) => void
   onDeleteTask: (id: string) => void
+  onJumpToTask: (agentId: string, taskId: string) => void
   onSend: (text: string) => void
   builderOpen: boolean
   onToggleBuilder: () => void
@@ -167,7 +169,7 @@ const TYPE_DOTS: Record<string, string> = {
   Task: '#A78BFA', Agent: '#F472B6', Run: '#38BDF8',
 }
 
-export function SpacePanel({ agent, tasks, selectedTaskId, messages, entities, isStreaming = false, currentRunId, onTaskSelect, onDeleteTask, onSend, builderOpen, onToggleBuilder }: SpacePanelProps) {
+export function SpacePanel({ agent, agents, tasks, selectedTaskId, messages, entities, isStreaming = false, currentRunId, onTaskSelect, onDeleteTask, onJumpToTask, onSend, builderOpen, onToggleBuilder }: SpacePanelProps) {
   const [inputValue, setInputValue] = useState('')
   const [delegations, setDelegations] = useState<Delegation[]>([])
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -331,22 +333,45 @@ export function SpacePanel({ agent, tasks, selectedTaskId, messages, entities, i
 
             {/* Delegations */}
             {delegations.length > 0 && (
-              <div style={{ padding: '0.5rem 1rem', borderTop: '1px solid var(--border, #e2e8f0)', fontSize: '0.8rem' }}>
-                <div style={{ fontWeight: 600, marginBottom: '0.25rem', color: 'var(--text-muted, #94a3b8)' }}>
-                  Delegations
+              <div style={{ padding: '8px 16px 10px', borderTop: '1px solid var(--color-border)', flexShrink: 0 }}>
+                <div style={{ fontSize: '10px', fontFamily: 'var(--font-mono)', letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--color-text-dim)', marginBottom: '6px' }}>
+                  delegations
                 </div>
-                {delegations.map(d => (
-                  <div key={d.id} style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginBottom: '0.15rem' }}>
-                    <span style={{
-                      padding: '1px 6px', borderRadius: 10, fontSize: '0.7rem',
-                      background: d.status === 'completed' ? '#22c55e22' : d.status === 'failed' ? '#ef444422' : '#3b82f622',
-                      color: d.status === 'completed' ? '#16a34a' : d.status === 'failed' ? '#dc2626' : '#2563eb',
-                    }}>
-                      {d.status}
-                    </span>
-                    <span>→ agent</span>
-                  </div>
-                ))}
+                {delegations.map(d => {
+                  const targetAgent = agents.find((a) => a.id === d.to_agent_spec_id)
+                  const agentName = targetAgent?.name ?? 'agent'
+                  return (
+                    <div key={d.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                      <span style={{
+                        fontSize: '9px', fontFamily: 'var(--font-mono)', letterSpacing: '0.04em',
+                        padding: '2px 6px', borderRadius: 3, flexShrink: 0,
+                        background: d.status === 'completed' ? 'rgba(52,211,153,0.12)' : d.status === 'failed' ? 'rgba(239,68,68,0.12)' : 'rgba(96,165,250,0.12)',
+                        color: d.status === 'completed' ? 'var(--color-success)' : d.status === 'failed' ? 'var(--color-error)' : 'var(--color-accent)',
+                      }}>
+                        {d.status}
+                      </span>
+                      <span style={{ fontSize: '11px', fontFamily: 'var(--font-sans)', color: 'var(--color-text-muted)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        → {agentName}
+                      </span>
+                      {d.task_entity_id && (
+                        <button
+                          onClick={() => onJumpToTask(d.to_agent_spec_id, d.task_entity_id!)}
+                          style={{
+                            fontSize: '10px', fontFamily: 'var(--font-mono)', fontWeight: 600,
+                            color: 'var(--color-accent)', background: 'var(--color-accent-bg)',
+                            border: '1px solid var(--color-accent)', borderRadius: 'var(--radius-sm)',
+                            padding: '2px 8px', cursor: 'pointer', letterSpacing: '0.02em', flexShrink: 0,
+                            transition: 'background 120ms ease, color 120ms ease',
+                          }}
+                          onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--color-accent)'; e.currentTarget.style.color = '#0B0C16' }}
+                          onMouseLeave={(e) => { e.currentTarget.style.background = 'var(--color-accent-bg)'; e.currentTarget.style.color = 'var(--color-accent)' }}
+                        >
+                          view →
+                        </button>
+                      )}
+                    </div>
+                  )
+                })}
               </div>
             )}
 

@@ -182,7 +182,7 @@ export function BuilderPanel({ agents, selectedId, onSelect, onUpdate, onDelete 
                   isConfirming ? (
                     <span onClick={(e) => e.stopPropagation()} style={{ display: 'flex', alignItems: 'center', gap: '3px', flexShrink: 0 }}>
                       <span style={{ fontSize: '10px', color: 'var(--color-text-dim)', fontFamily: 'var(--font-sans)' }}>Sure?</span>
-                      <button onClick={async (e) => { e.stopPropagation(); await deleteAgent(agent.id).catch(console.error); onDelete(agent.id) }}
+                      <button onClick={async (e) => { e.stopPropagation(); try { await deleteAgent(agent.id); onDelete(agent.id) } catch (err) { console.error(err) } }}
                         style={{ fontSize: '10px', fontFamily: 'var(--font-sans)', fontWeight: 600, color: 'var(--color-error)', background: 'none', border: 'none', cursor: 'pointer', padding: '0 2px' }}>Yes</button>
                       <button onClick={(e) => { e.stopPropagation(); setConfirmingDelete(null) }}
                         style={{ fontSize: '10px', fontFamily: 'var(--font-sans)', color: 'var(--color-text-dim)', background: 'none', border: 'none', cursor: 'pointer', padding: '0 2px' }}>No</button>

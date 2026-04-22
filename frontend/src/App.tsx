@@ -71,6 +71,34 @@ export default function App() {
     }).catch(console.error)
   }, [selectedTaskId])
 
+  const agentTasks = tasks[selectedAgentId] ?? []
+  const hasInProgressTask = agentTasks.some((t) => t.status === 'in_progress')
+  const isSelectedTaskActive = agentTasks.find((t) => t.id === selectedTaskId)?.status === 'in_progress'
+
+  // Poll tasks + runs + entities while any background task is running
+  useEffect(() => {
+    if (!selectedAgentId || !hasInProgressTask) return
+    const id = window.setInterval(() => {
+      getAgentTasks(selectedAgentId).then((loaded) => {
+        setTasks((prev) => ({ ...prev, [selectedAgentId]: loaded }))
+      }).catch(console.error)
+      getRuns().then(setRuns).catch(console.error)
+      getEntities().then(setEntities).catch(console.error)
+    }, 3000)
+    return () => clearInterval(id)
+  }, [selectedAgentId, hasInProgressTask]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Poll messages while the selected task is still running
+  useEffect(() => {
+    if (!selectedTaskId || !isSelectedTaskActive) return
+    const id = window.setInterval(() => {
+      getTaskMessages(selectedTaskId).then((loaded) => {
+        setMessages((prev) => ({ ...prev, [selectedTaskId]: loaded }))
+      }).catch(console.error)
+    }, 2000)
+    return () => clearInterval(id)
+  }, [selectedTaskId, isSelectedTaskActive])
+
   const selectedAgent = agents.find((a) => a.id === selectedAgentId) ?? agents[0]
   const currentMessages = messages[selectedTaskId] ?? []
 
@@ -134,7 +162,12 @@ export default function App() {
   }
 
   const handleDeleteTask = async (taskId: string) => {
-    await deleteTask(taskId).catch(console.error)
+    try {
+      await deleteTask(taskId)
+    } catch (err) {
+      console.error(err)
+      return
+    }
     setTasks((prev) => ({ ...prev, [selectedAgentId]: (prev[selectedAgentId] ?? []).filter((t) => t.id !== taskId) }))
     setMessages((prev) => { const next = { ...prev }; delete next[taskId]; return next })
     if (selectedTaskIds[selectedAgentId] === taskId) {
@@ -158,6 +191,12 @@ export default function App() {
       return remaining
     })
   }
+
+  const handleJumpToTask = useCallback((agentId: string, taskId: string) => {
+    setTab('workspace')
+    setSelectedAgentId(agentId)
+    setSelectedTaskIds((prev) => ({ ...prev, [agentId]: taskId }))
+  }, [])
 
   const handleAgentSelect = (id: string) => {
     setSelectedAgentId(id)
@@ -192,6 +231,7 @@ export default function App() {
 
           <SpacePanel
             agent={selectedAgent}
+            agents={agents}
             tasks={tasks[selectedAgentId] ?? []}
             selectedTaskId={selectedTaskId}
             messages={currentMessages}
@@ -200,6 +240,7 @@ export default function App() {
             currentRunId={currentRunId}
             onTaskSelect={(id) => setSelectedTaskIds((prev) => ({ ...prev, [selectedAgentId]: id }))}
             onDeleteTask={handleDeleteTask}
+            onJumpToTask={handleJumpToTask}
             onSend={handleSend}
             builderOpen={builderOpen}
             onToggleBuilder={() => setBuilderOpen((v) => !v)}
