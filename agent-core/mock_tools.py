@@ -276,12 +276,36 @@ async def _run_child_agent(
             context_entity_ids=context_entity_ids,
         )
 
+    from db import Message  # noqa: PLC0415
+    from claude_agent_sdk.types import AssistantMessage, TextBlock, ToolUseBlock  # noqa: PLC0415
+
     options = build_options_from_spec(spec, run_ctx, permission_mode="bypassPermissions")
+
+    # Persist the user prompt immediately so the task shows activity right away
+    async with db_session() as session:
+        session.add(Message(
+            run_id=run_ctx.run_id,
+            role="user",
+            content={"text": task_prompt, "tool_calls": []},
+        ))
 
     sdk_messages: list = []
     try:
         async for msg in query(prompt=task_prompt, options=options):
             sdk_messages.append(msg)
+            # Persist each assistant turn as it arrives so the frontend can poll progress
+            if isinstance(msg, AssistantMessage):
+                text = " ".join(b.text for b in msg.content if isinstance(b, TextBlock))
+                tool_calls = [
+                    {"id": b.id, "tool": b.name, "args": b.input}
+                    for b in msg.content if isinstance(b, ToolUseBlock)
+                ]
+                async with db_session() as session:
+                    session.add(Message(
+                        run_id=run_ctx.run_id,
+                        role="assistant",
+                        content={"text": text, "tool_calls": tool_calls},
+                    ))
     except Exception as exc:
         import logging as _log  # noqa: PLC0415
         _log.getLogger(__name__).error(
@@ -292,6 +316,7 @@ async def _run_child_agent(
 
     async with db_session() as session:
         from sqlalchemy import select as _select  # noqa: PLC0415
+
         await end_run(session, run_ctx, sdk_messages)
 
         produced_ids = (
@@ -390,7 +415,7 @@ async def _delegate_task_impl(args: dict, run_ctx, *, _session=None) -> dict:
             return {
                 "error": (
                     f"No delegates_to edge from {run_ctx.spec.name!r} to "
-                    f"{target_spec.name!r}. Add this edge in the Topology panel first."
+                    f"{target_spec.name!r}. Add this edge in the Ontology first."
                 )
             }
 
