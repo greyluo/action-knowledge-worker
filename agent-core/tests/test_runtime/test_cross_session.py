@@ -211,12 +211,13 @@ async def test_cross_session_continuity(seeded):
                 new_deal,                     # judge: Acme Renewal 2026 → Deal
             ]
         )
-        entity_ids_session1 = await ontologist_step(
+        result_session1 = await ontologist_step(
             tool_name="fetch_company_data",
             tool_input={"company_name": "Acme Corp"},
             tool_output=COMPANY_DATA["Acme Corp"],
             run_ctx=ctx1,
         )
+        entity_ids_session1 = result_session1.entity_ids
 
     assert len(entity_ids_session1) >= 3, (
         f"Expected at least 3 entities from Session 1, got {len(entity_ids_session1)}"

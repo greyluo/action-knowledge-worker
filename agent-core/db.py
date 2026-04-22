@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from sqlalchemy import (
-    UUID, Boolean, DateTime, ForeignKey, Integer, String, Text,
+    UUID, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -101,6 +101,8 @@ class EdgeType(Base):
     name: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     is_transitive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_inverse_of: Mapped[str | None] = mapped_column(String, nullable=True)
+    domain: Mapped[str | None] = mapped_column(String, nullable=True)
+    range_: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -117,6 +119,7 @@ class Entity(Base):
 
 class Edge(Base):
     __tablename__ = "edges"
+    __table_args__ = (UniqueConstraint("src_id", "dst_id", "edge_type_id", name="uq_edge_src_dst_type"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
     src_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("entities.id"), nullable=False)
     dst_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("entities.id"), nullable=False)
@@ -133,4 +136,16 @@ class OntologyEvent(Base):
     actor: Mapped[str] = mapped_column(String, nullable=False)
     entity_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class PolicyRule(Base):
+    __tablename__ = "policy_rules"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=_uuid)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    tool_pattern: Mapped[str] = mapped_column(String, nullable=False)
+    subject_key: Mapped[str] = mapped_column(String, nullable=False)
+    subject_type: Mapped[str] = mapped_column(String, nullable=False)
+    blocking_conditions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

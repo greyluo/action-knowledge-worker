@@ -237,12 +237,12 @@ async def test_full_write_then_read_path(seeded):
                 new_deal,              # judge: Acme Renewal 2026 → Deal
             ]
         )
-        entity_ids_step2 = await ontologist_step(
+        entity_ids_step2 = (await ontologist_step(
             tool_name="fetch_company_data",
             tool_input={"company_name": "Acme Corp"},
             tool_output=COMPANY_DATA["Acme Corp"],
             run_ctx=ctx,
-        )
+        )).entity_ids
 
     assert len(entity_ids_step2) >= 1, "No entities created from company data"
 
@@ -304,12 +304,12 @@ async def test_full_write_then_read_path(seeded):
                 reuse_person_resp,   # judge: Alice Chen → REUSE Person
             ]
         )
-        entity_ids_step4 = await ontologist_step(
+        entity_ids_step4 = (await ontologist_step(
             tool_name="fetch_email_thread",
             tool_input={"thread_id": "thread_001"},
             tool_output=EMAIL_THREADS["thread_001"],
             run_ctx=ctx,
-        )
+        )).entity_ids
 
     assert len(entity_ids_step4) >= 1, "No entities resolved from email thread"
 

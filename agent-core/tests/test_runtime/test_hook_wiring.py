@@ -15,9 +15,14 @@ async def test_build_options_returns_claude_agent_options(session):
 
     options = build_options_from_spec(spec, ctx)
 
-    # Verify options object has expected attributes
+    from seed import SYSTEM_PROMPT as BASE_PROMPT
+
     assert options is not None
-    assert options.system_prompt == spec.system_prompt
-    # Check PostToolUse hook is wired (exact attribute depends on SDK version)
+    # Base ontology prompt is always injected regardless of spec content
+    assert options.system_prompt.startswith(BASE_PROMPT)
+    # Ontology tools are always present
+    assert "mcp__demo__query_graph" in options.allowed_tools
+    assert "mcp__demo__remember_entity" in options.allowed_tools
+    # PostToolUse hook is wired
     hooks = getattr(options, 'hooks', None) or getattr(options, 'post_tool_use_hooks', None)
     assert hooks is not None, "No hooks found on options object"

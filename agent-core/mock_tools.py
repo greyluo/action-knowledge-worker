@@ -16,6 +16,27 @@ from claude_agent_sdk import ToolAnnotations, create_sdk_mcp_server, tool
 # ---------------------------------------------------------------------------
 
 COMPANY_DATA: dict[str, Any] = {
+    "TechStartup": {
+        "company": {"name": "TechStartup", "domain": "techstartup.io", "industry": "Software"},
+        "employees": [
+            {
+                "name": "Alex Johnson",
+                "email": "alex@techstartup.io",
+                "role": "Lead Developer",
+                "assigned_project": "Mobile App Redesign",
+            },
+            {"name": "Maria Santos", "email": "maria@techstartup.io", "role": "HR Manager"},
+        ],
+        "projects": [
+            {
+                "name": "Mobile App Redesign",
+                "status": "pending",
+                "description": "Critical Q4 product launch — blocked by terminating lead",
+                "lead": "Alex Johnson",
+                "deadline": "2026-12-31",
+            }
+        ],
+    },
     "Acme Corp": {
         "company": {"name": "Acme Corp", "domain": "acme.com", "industry": "Manufacturing"},
         "employees": [
@@ -142,11 +163,32 @@ async def fetch_email_thread(args: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool(
+    "terminate_employee",
+    (
+        "Terminate an employee's contract. This is a destructive, irreversible action. "
+        "Before calling this tool, verify there are no blocking constraints (e.g. active project assignments)."
+    ),
+    {"employee_name": str, "reason": str},
+    annotations=ToolAnnotations(readOnlyHint=False),
+)
+async def terminate_employee(args: dict[str, Any]) -> dict[str, Any]:
+    name: str = args.get("employee_name", "")
+    reason: str = args.get("reason", "")
+    result = {
+        "status": "terminated",
+        "employee": name,
+        "reason": reason,
+        "message": f"{name}'s contract has been terminated.",
+    }
+    return {"content": [{"type": "text", "text": json.dumps(result)}]}
+
+
+@tool(
     "remember_entity",
     (
-        "Persist a fact about a person, company, or deal to the knowledge graph. "
+        "Persist a fact about a person, company, or deal to ontology. "
         "Call this when the user provides information that should be remembered "
-        "(e.g. a name change, a new contact, an updated deal status)."
+        "(e.g. a name change, a new contact, an updated deal status). "
     ),
     {"name": str, "type_hint": str, "properties": dict},
     annotations=ToolAnnotations(readOnlyHint=False),
@@ -158,7 +200,7 @@ async def remember_entity(args: dict[str, Any]) -> dict[str, Any]:
 @tool(
     "query_graph",
     (
-        "Query the knowledge graph for typed entities and their relationships. "
+        "Query Ontology for typed entities and their relationships. "
         "Use this to look up previously discovered companies, people, deals, and tasks "
         "before making decisions."
     ),
@@ -196,5 +238,5 @@ async def query_graph_tool(args: dict[str, Any]) -> dict[str, Any]:
 demo_server = create_sdk_mcp_server(
     name="demo",
     version="1.0.0",
-    tools=[fetch_company_data, fetch_email_thread, remember_entity, query_graph_tool],
+    tools=[fetch_company_data, fetch_email_thread, terminate_employee, remember_entity, query_graph_tool],
 )

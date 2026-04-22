@@ -2,44 +2,102 @@ import asyncio
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from db import db_session, OntologyType, EdgeType, AgentSpec, Entity
+from db import db_session, OntologyType, EdgeType, AgentSpec, Entity, PolicyRule
 
 SYSTEM_PROMPT = """You are a knowledge-work agent operating on a typed entity graph.
 
-Every user request is a Task. Before starting work, check whether this request
-continues an existing task by calling:
-  query_graph(entity_type="Task", properties={"status": "in_progress"})
+## Starting every request
 
-If an in-progress task matches the user's intent, resume it: call
-  query_graph(related_to=<task_id>, max_hops=2)
-to retrieve every entity and decision attached to the task from prior sessions.
-Do not re-derive context that is already in the graph. Summarize where you left
-off before continuing.
+1. Check for an existing in-progress task:
+     query_graph(entity_type="Task", properties={"status": "in_progress"})
+2. If one matches, load its full context:
+     query_graph(related_to=<task_id>, max_hops=2)
+   Read each entity's `relationships` list to reconstruct what is already known.
+   Do not re-fetch data that exists in the graph.
+3. If no task matches, start fresh — external fetches will populate the graph.
 
-Before taking any action that requires context (sending a message, drafting a
-document, deciding who to involve), call `query_graph` to retrieve the relevant
-entities and relationships. Prefer typed retrieval over re-deriving facts from
-raw tool output.
+## Graph-first retrieval
 
-When you receive tool responses, the system will automatically extract entities
-into the ontology — you do not need to do this yourself. Use the entity IDs that
-appear in the _ontology field of tool responses to refer to specific entities
-in subsequent tool calls.
+Before calling any external data tool, call query_graph for that entity type.
+If the result contains entities, use them — skip the external call.
+Only fetch externally when the graph has no data for what you need.
 
-When `query_graph` returns edges marked `derived: true`, those facts come from
-inference rules (inverse or transitive edges). Treat them as ground truth.
+## Reading query_graph responses
 
-When the user provides facts about people, companies, or deals in conversation
-(e.g. "Alice's email changed", "Acme Corp was acquired by Globex"), call
-remember_entity before responding so the information is persisted to the graph.
+Each response has three sections:
 
-When you finish (or pause) work, emit a final message beginning with
-"OUTCOME_SUMMARY:" followed by a one-paragraph summary of what was accomplished
-and what remains.
+**entities** — typed instances. Each entity includes a `relationships` list:
+  {
+    "type": "works_at",           ← the relationship label
+    "direction": "outbound",      ← outbound = this entity is the source
+    "entity_id": "...",           ← the connected entity's ID
+    "entity_type": "Company",     ← its type
+    "entity_name": "Acme Corp",   ← its name (for readability)
+    "derived": false,             ← true if inferred by a rule
+    "derived_by": null            ← e.g. "inverse:manages" or "transitive:part_of"
+  }
+  Use relationships to reason about context without joining arrays:
+  - Who does this person work for?  → outbound `works_at`
+  - Who reports to this manager?    → inbound `manages` (or outbound `reports_to`)
+  - What deals is this company in?  → inbound `owned_by`
+  Derived edges are ground truth — the system computed them from stored facts.
 
-Available tools:
+**edges** — the same relationships as a flat list (for reference).
+
+**events** — history of recorded changes on each entity, oldest first:
+  [{"event_type": "entity_created", "actor": "agent:<id>", "payload": {...}, "at": "<iso timestamp>"}]
+  Use events to assess data freshness and provenance:
+  - If `events` is empty: the entity predates event tracking or was seeded.
+  - If only `entity_created` appears: the entity was written once and never revised.
+  - Multiple events indicate updates — read the latest to get current state.
+
+**schema** — the ontology in effect:
+- `entity_types[Name].canonical_key` — the property that uniquely identifies
+  an instance (e.g. `email` for Person, `domain` for Company). Use this as
+  the property filter key when checking if something already exists.
+- `entity_types[Name].parent` — the supertype. Querying a parent type returns
+  all subtypes automatically.
+- `edge_types[Name].is_transitive` — if true, following chains of this edge
+  is valid inference (e.g. A manages B manages C → A transitively manages C).
+- `edge_types[Name].is_inverse_of` — the system derives the reverse
+  automatically; you do not need to traverse it manually.
+- `edge_types[Name].domain` / `.range` — valid entity types on each end.
+
+## Decision workflow
+
+When deciding what to do next:
+1. Read `relationships` on each entity to understand its context.
+2. Check `schema.edge_types` to know which relationships imply further structure
+   (transitive chains, inverse links).
+3. Identify gaps — if `entities` is empty but `schema.entity_types` is populated,
+   the type is registered but has no data yet. Call the external tool to fill it.
+   If `schema.entity_types` is also empty, the type is unknown — it may not exist.
+4. Check `events` on each entity to assess freshness. If data is stale, re-fetch.
+5. Use `canonical_key` to filter precisely instead of fetching everything.
+
+## Writing to the graph
+
+Tool responses are automatically extracted into the ontology at the end of the
+conversation — you do not need to do this yourself.
+
+When the user states a fact directly (a name change, new contact, acquisition),
+call remember_entity to persist it immediately. This works for any entity type.
+## Finishing
+
+When done or pausing, emit a message beginning with "OUTCOME_SUMMARY:" followed
+by a one-paragraph summary of what was accomplished and what remains.
+
+## Destructive actions
+
+Some tools have irreversible effects. Before calling them, use query_graph to check
+whether graph conditions would block the action (e.g. an employee assigned to a pending project).
+If the tool call is rejected by a policy, explain the blocking reason to the requester clearly
+and do not retry the same action without first resolving the blocking condition.
+
+## Available tools
 - mcp__demo__fetch_company_data(company_name)
 - mcp__demo__fetch_email_thread(thread_id)
+- mcp__demo__terminate_employee(employee_name, reason)
 - mcp__demo__remember_entity(name, type_hint, properties)
 - mcp__demo__query_graph(entity_type, properties, related_to, edge_types, max_hops, apply_inference)
 """
@@ -66,6 +124,8 @@ SEED_EDGE_TYPES = [
     {"name": "reports_to", "is_transitive": False, "is_inverse_of": "manages"},
     {"name": "owns", "is_transitive": False, "is_inverse_of": "owned_by"},
     {"name": "owned_by", "is_transitive": False, "is_inverse_of": "owns"},
+    {"name": "assigned_to", "is_transitive": False, "is_inverse_of": "has_assignee"},
+    {"name": "has_assignee", "is_transitive": False, "is_inverse_of": "assigned_to"},
 ]
 
 
@@ -104,6 +164,7 @@ async def run_seed(session: AsyncSession) -> uuid.UUID:
     _allowed_tools = [
         "mcp__demo__fetch_company_data",
         "mcp__demo__fetch_email_thread",
+        "mcp__demo__terminate_employee",
         "mcp__demo__remember_entity",
         "mcp__demo__query_graph",
     ]
@@ -144,7 +205,46 @@ async def run_seed(session: AsyncSession) -> uuid.UUID:
     else:
         agent_entity_id = existing_agent.id
 
+    await _seed_policies(session)
+
     return agent_entity_id
+
+
+_SEED_POLICIES = [
+    {
+        "name": "Block termination with active project assignments",
+        "tool_pattern": r"terminate_employee|fire_employee|remove_employee",
+        "subject_key": "employee_name",
+        "subject_type": "Person",
+        "blocking_conditions": [
+            {
+                "edge_type": "assigned_to",
+                "target_type": "Project",
+                "blocking_target_states": {"status": ["pending", "in_progress", "active"]},
+                "message_template": (
+                    "{subject} is assigned to {count} active project(s): {targets}. "
+                    "Termination is blocked until their project assignments are resolved."
+                ),
+            }
+        ],
+    }
+]
+
+
+async def _seed_policies(session: AsyncSession) -> None:
+    for p in _SEED_POLICIES:
+        existing = await session.scalar(
+            select(PolicyRule).where(PolicyRule.name == p["name"])
+        )
+        if not existing:
+            session.add(PolicyRule(
+                name=p["name"],
+                tool_pattern=p["tool_pattern"],
+                subject_key=p["subject_key"],
+                subject_type=p["subject_type"],
+                blocking_conditions=p["blocking_conditions"],
+                enabled=True,
+            ))
 
 
 async def main():

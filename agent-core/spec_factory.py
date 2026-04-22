@@ -1,6 +1,7 @@
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,31 +42,39 @@ async def begin_run(
     prompt: str,
     spec: AgentSpec,
     agent_entity_id: uuid.UUID,
+    task_id: uuid.UUID | None = None,
 ) -> RunContext:
-    task_entity = await _maybe_resume_task(session, prompt)
+    if task_id:
+        task_entity = await session.get(Entity, task_id)
+        if task_entity:
+            task_entity.properties = {**task_entity.properties, "status": "in_progress"}
+        else:
+            task_id = None
 
-    if task_entity:
-        task_entity.properties = {**task_entity.properties, "status": "in_progress"}
-        task_id = task_entity.id
-    else:
-        task_type = await session.scalar(
-            select(OntologyType).where(OntologyType.name == "Task")
-        )
-        title = prompt[:80] if len(prompt) > 80 else prompt
-        task_entity = Entity(
-            type_id=task_type.id,
-            properties={
-                "title": title,
-                "description": prompt,
-                "status": "in_progress",
-                "outcome_summary": None,
-            },
-            source_refs=[{"source": "user_prompt"}],
-            created_by_agent_id=agent_entity_id,
-        )
-        session.add(task_entity)
-        await session.flush()
-        task_id = task_entity.id
+    if not task_id:
+        task_entity = await _maybe_resume_task(session, prompt)
+        if task_entity:
+            task_entity.properties = {**task_entity.properties, "status": "in_progress"}
+            task_id = task_entity.id
+        else:
+            task_type = await session.scalar(
+                select(OntologyType).where(OntologyType.name == "Task")
+            )
+            title = prompt[:80] if len(prompt) > 80 else prompt
+            task_entity = Entity(
+                type_id=task_type.id,
+                properties={
+                    "title": title,
+                    "description": prompt,
+                    "status": "in_progress",
+                    "outcome_summary": None,
+                },
+                source_refs=[{"source": "user_prompt"}],
+                created_by_agent_id=agent_entity_id,
+            )
+            session.add(task_entity)
+            await session.flush()
+            task_id = task_entity.id
 
     run = Run(spec_id=spec.id, in_service_of_task_id=task_id)
     session.add(run)
@@ -165,28 +174,114 @@ async def end_run(session: AsyncSession, ctx: RunContext, messages: list) -> Non
         task.properties = props
 
 
-def build_options_from_spec(spec: AgentSpec, run_ctx: RunContext):
+import logging as _logging
+_logger = _logging.getLogger(__name__)
+
+_ONTOLOGY_TOOLS = frozenset({
+    "mcp__demo__remember_entity",
+    "mcp__demo__query_graph",
+})
+
+# Tool outputs from these are not external data — skip ontology extraction
+_SKIP_COLLECTION = frozenset({"mcp__demo__query_graph"})
+
+
+def build_options_from_spec(
+    spec: AgentSpec,
+    run_ctx: RunContext,
+    streaming_hook=None,
+    permission_mode: str | None = None,
+):
     """Build ClaudeAgentOptions from a spec and run context.
 
-    Wires:
-    - system_prompt from spec.system_prompt
-    - PostToolUse hook via ontologist.make_ontologist_hook
-    - MCP server named "demo" from mock_tools.demo_server
+    All agents get:
+    - Base ontology system prompt prepended to their goal prompt
+    - query_graph and remember_entity always in allowed_tools
+    - PostToolUse: collects external tool outputs (skips query_graph)
+    - Stop: batch-runs the ontologist over all collected outputs
     """
     from mock_tools import demo_server
-    from ontologist import make_ontologist_hook
+    from ontologist import ontologist_step
+    from seed import SYSTEM_PROMPT as _BASE_PROMPT
     from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
 
-    hook_fn = make_ontologist_hook(run_ctx)
+    if spec.system_prompt and spec.system_prompt.strip():
+        system_prompt = _BASE_PROMPT + "\n\n## Agent goal\n" + spec.system_prompt.strip()
+    else:
+        system_prompt = _BASE_PROMPT
+
+    allowed_tools = list(_ONTOLOGY_TOOLS | set(spec.allowed_tools or []))
+
+    accumulated: list[tuple[str, dict, Any]] = []
+
+    async def policy_hook(hook_input, session_id, hook_context) -> dict:
+        from policies import check_policies  # noqa: PLC0415
+
+        tool_name = hook_input.get("tool_name", "") if isinstance(hook_input, dict) else getattr(hook_input, "tool_name", "")
+        tool_input_val = hook_input.get("tool_input", {}) if isinstance(hook_input, dict) else getattr(hook_input, "tool_input", {})
+        hook_event_name = hook_input.get("hook_event_name", "PreToolUse") if isinstance(hook_input, dict) else getattr(hook_input, "hook_event_name", "PreToolUse")
+
+        try:
+            reason = await check_policies(tool_name, tool_input_val or {}, run_ctx)
+        except Exception as exc:
+            _logger.exception("policy check failed for tool %s: %s", tool_name, exc)
+            return {}
+
+        if reason:
+            _logger.info("Policy blocked %s: %s", tool_name, reason)
+            return {
+                "systemMessage": (
+                    f"Action blocked by policy: {reason} "
+                    "Explain this blocking reason to the requester and do not retry."
+                ),
+                "hookSpecificOutput": {
+                    "hookEventName": hook_event_name,
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                },
+            }
+        return {}
+
+    async def collect_hook(hook_input, session_id, hook_context) -> dict:
+        tool_name = hook_input.get("tool_name", "") if isinstance(hook_input, dict) else getattr(hook_input, "tool_name", "")
+        tool_input_val = hook_input.get("tool_input", {}) if isinstance(hook_input, dict) else getattr(hook_input, "tool_input", {})
+        tool_output = hook_input.get("tool_response", None) if isinstance(hook_input, dict) else getattr(hook_input, "tool_response", None)
+        if tool_name == "mcp__demo__remember_entity":
+            # Persist immediately — don't batch; user-stated facts should be available
+            # to query_graph within the same session
+            try:
+                await ontologist_step(tool_name, tool_input_val or {}, tool_output, run_ctx)
+            except Exception as exc:
+                _logger.exception("remember_entity persist failed: %s", exc)
+        elif tool_name not in _SKIP_COLLECTION and tool_output is not None:
+            accumulated.append((tool_name, tool_input_val or {}, tool_output))
+        return {}
+
+    async def stop_hook(hook_input, session_id, hook_context) -> dict:
+        for tool_name, tool_input_val, tool_output in accumulated:
+            try:
+                await ontologist_step(tool_name, tool_input_val, tool_output, run_ctx)
+            except Exception as exc:
+                _logger.exception("batch ontologist failed for tool %s: %s", tool_name, exc)
+        return {}
+
+    post_tool_hooks = [collect_hook]
+    if streaming_hook:
+        post_tool_hooks.append(streaming_hook)
+
+    kwargs = {}
+    if permission_mode is not None:
+        kwargs["permission_mode"] = permission_mode
 
     return ClaudeAgentOptions(
-        system_prompt=spec.system_prompt,
-        allowed_tools=spec.allowed_tools,
+        system_prompt=system_prompt,
+        allowed_tools=allowed_tools,
         mcp_servers={"demo": demo_server},
         hooks={
-            "PostToolUse": [
-                HookMatcher(matcher="*", hooks=[hook_fn]),
-            ]
+            "PreToolUse": [HookMatcher(matcher="*", hooks=[policy_hook])],
+            "PostToolUse": [HookMatcher(matcher="*", hooks=post_tool_hooks)],
+            "Stop": [HookMatcher(matcher="*", hooks=[stop_hook])],
         },
         max_turns=spec.max_turns or 20,
+        **kwargs,
     )
