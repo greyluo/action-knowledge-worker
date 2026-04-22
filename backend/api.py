@@ -13,11 +13,11 @@ from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(os.path.join(AGENT_CORE, ".env"))
 
-from fastapi import FastAPI  # noqa: E402
+from fastapi import FastAPI, HTTPException  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
-from sqlalchemy import select  # noqa: E402
+from sqlalchemy import delete as sql_delete, select  # noqa: E402
 
 from db import (  # noqa: E402
     AgentSpec as DbAgentSpec,
@@ -27,6 +27,7 @@ from db import (  # noqa: E402
     Message as DbMessage,
     OntologyEvent as DbOntologyEvent,
     OntologyType as DbOntologyType,
+    PolicyRule as DbPolicyRule,
     Run as DbRun,
     db_session,
 )
@@ -72,50 +73,47 @@ async def list_agents():
 @app.get("/agents/{agent_id}/tasks")
 async def list_tasks(agent_id: str):
     async with db_session() as session:
-        task_type = await session.scalar(
-            select(DbOntologyType).where(DbOntologyType.name == "Task")
-        )
-        if not task_type:
+        # Find all task IDs via runs — runs always carry the spec_id directly,
+        # so this works even if the Agent ontology entity is missing.
+        run_rows = (
+            await session.execute(
+                select(DbRun)
+                .where(
+                    DbRun.spec_id == uuid.UUID(agent_id),
+                    DbRun.in_service_of_task_id.isnot(None),
+                )
+            )
+        ).scalars().all()
+
+        task_ids = list({r.in_service_of_task_id for r in run_rows})
+        if not task_ids:
             return []
 
-        agent_type = await session.scalar(
-            select(DbOntologyType).where(DbOntologyType.name == "Agent")
-        )
-        agent_entity = None
-        if agent_type:
-            agent_entity = await session.scalar(
-                select(DbEntity).where(
-                    DbEntity.type_id == agent_type.id,
-                    DbEntity.properties["spec_id"].astext == agent_id,
-                )
+        # Group run counts by task
+        run_count: dict[uuid.UUID, int] = {}
+        for r in run_rows:
+            run_count[r.in_service_of_task_id] = run_count.get(r.in_service_of_task_id, 0) + 1
+
+        task_entities = (
+            await session.execute(
+                select(DbEntity)
+                .where(DbEntity.id.in_(task_ids))
+                .order_by(DbEntity.created_at.desc())
             )
+        ).scalars().all()
 
-        query = select(DbEntity).where(DbEntity.type_id == task_type.id)
-        if agent_entity:
-            query = query.where(DbEntity.created_by_agent_id == agent_entity.id)
-
-        task_rows = (await session.execute(query.order_by(DbEntity.created_at.desc()))).scalars().all()
-
-        result = []
-        for t in task_rows:
-            props = t.properties or {}
-            runs = (
-                await session.execute(
-                    select(DbRun).where(DbRun.in_service_of_task_id == t.id)
-                )
-            ).scalars().all()
-            result.append(
-                {
-                    "id": str(t.id),
-                    "spec_id": agent_id,
-                    "title": props.get("title", "Untitled"),
-                    "status": props.get("status", "pending"),
-                    "session_count": len(runs),
-                    "entity_count": 0,
-                    "outcome_summary": props.get("outcome_summary"),
-                }
-            )
-        return result
+        return [
+            {
+                "id": str(t.id),
+                "spec_id": agent_id,
+                "title": (t.properties or {}).get("title", "Untitled"),
+                "status": (t.properties or {}).get("status", "pending"),
+                "session_count": run_count.get(t.id, 0),
+                "entity_count": 0,
+                "outcome_summary": (t.properties or {}).get("outcome_summary"),
+            }
+            for t in task_entities
+        ]
 
 
 @app.get("/tasks/{task_id}/messages")
@@ -152,7 +150,26 @@ async def get_messages(task_id: str):
         return messages
 
 
-_NAME_FIELDS = ("name", "title", "email", "domain", "company", "subject", "label", "full_name", "display_name")
+@app.delete("/tasks/{task_id}", status_code=204)
+async def delete_task(task_id: str):
+    async with db_session() as session:
+        tid = uuid.UUID(task_id)
+        # Delete messages and runs
+        runs = (await session.execute(select(DbRun).where(DbRun.in_service_of_task_id == tid))).scalars().all()
+        for run in runs:
+            await session.execute(sql_delete(DbMessage).where(DbMessage.run_id == run.id))
+            await session.delete(run)
+        await session.flush()
+        # Delete edges referencing the task entity
+        await session.execute(sql_delete(DbEdge).where(DbEdge.src_id == tid))
+        await session.execute(sql_delete(DbEdge).where(DbEdge.dst_id == tid))
+        # Delete the task entity itself
+        task = await session.get(DbEntity, tid)
+        if task:
+            await session.delete(task)
+
+
+_NAME_FIELDS = ("name", "full_name", "display_name", "title", "company", "subject", "label", "email")
 
 def _entity_display_name(props: dict, entity_id) -> str:
     for key in _NAME_FIELDS:
@@ -243,6 +260,24 @@ async def list_entity_types():
         ]
 
 
+class CreateEntityTypeRequest(BaseModel):
+    name: str
+    canonical_key: str | None = None
+    description: str | None = None
+
+
+@app.post("/schema/entity-types", status_code=201)
+async def create_entity_type(body: CreateEntityTypeRequest):
+    async with db_session() as session:
+        existing = await session.scalar(select(DbOntologyType).where(DbOntologyType.name == body.name))
+        if existing:
+            raise HTTPException(status_code=409, detail=f"Entity type '{body.name}' already exists")
+        otype = DbOntologyType(name=body.name, canonical_key=body.canonical_key or None, description=body.description or None)
+        session.add(otype)
+        await session.flush()
+        return {"name": otype.name, "canonical_key": otype.canonical_key, "description": otype.description}
+
+
 @app.get("/schema/edge-types")
 async def list_edge_types():
     async with db_session() as session:
@@ -257,6 +292,102 @@ async def list_edge_types():
             }
             for t in types
         ]
+
+
+# ---------------------------------------------------------------------------
+# Entity / Edge CRUD
+# ---------------------------------------------------------------------------
+
+def _entity_row(entity: DbEntity, type_name: str) -> dict:
+    return {
+        "id": str(entity.id),
+        "type": type_name,
+        "name": _entity_display_name(entity.properties or {}, entity.id),
+        "properties": entity.properties or {},
+        "source_refs": entity.source_refs or [],
+        "created_in_run_id": str(entity.created_in_run_id) if entity.created_in_run_id else None,
+    }
+
+
+class CreateEntityRequest(BaseModel):
+    type_name: str
+    properties: dict = {}
+
+
+@app.post("/entities", status_code=201)
+async def create_entity(body: CreateEntityRequest):
+    async with db_session() as session:
+        otype = await session.scalar(select(DbOntologyType).where(DbOntologyType.name == body.type_name))
+        if not otype:
+            raise HTTPException(status_code=404, detail=f"Entity type {body.type_name!r} not found")
+        entity = DbEntity(type_id=otype.id, properties=body.properties, source_refs=[{"manual": True}])
+        session.add(entity)
+        await session.flush()
+        return _entity_row(entity, otype.name)
+
+
+class UpdateEntityRequest(BaseModel):
+    properties: dict
+
+
+@app.patch("/entities/{entity_id}")
+async def update_entity(entity_id: str, body: UpdateEntityRequest):
+    async with db_session() as session:
+        entity = await session.get(DbEntity, uuid.UUID(entity_id))
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        entity.properties = body.properties
+        await session.flush()
+        otype = await session.get(DbOntologyType, entity.type_id)
+        return _entity_row(entity, otype.name if otype else "Unknown")
+
+
+@app.delete("/entities/{entity_id}", status_code=204)
+async def delete_entity(entity_id: str):
+    async with db_session() as session:
+        eid = uuid.UUID(entity_id)
+        entity = await session.get(DbEntity, eid)
+        if not entity:
+            raise HTTPException(status_code=404, detail="Entity not found")
+        await session.execute(sql_delete(DbEdge).where(DbEdge.src_id == eid))
+        await session.execute(sql_delete(DbEdge).where(DbEdge.dst_id == eid))
+        await session.delete(entity)
+
+
+class CreateEdgeRequest(BaseModel):
+    src_id: str
+    dst_id: str
+    edge_type_name: str
+
+
+@app.post("/edges", status_code=201)
+async def create_edge(body: CreateEdgeRequest):
+    async with db_session() as session:
+        etype = await session.scalar(select(DbEdgeType).where(DbEdgeType.name == body.edge_type_name))
+        if not etype:
+            raise HTTPException(status_code=404, detail=f"Edge type {body.edge_type_name!r} not found")
+        existing = await session.scalar(
+            select(DbEdge).where(
+                DbEdge.src_id == uuid.UUID(body.src_id),
+                DbEdge.dst_id == uuid.UUID(body.dst_id),
+                DbEdge.edge_type_id == etype.id,
+            )
+        )
+        if existing:
+            raise HTTPException(status_code=409, detail="Edge already exists")
+        edge = DbEdge(src_id=uuid.UUID(body.src_id), dst_id=uuid.UUID(body.dst_id), edge_type_id=etype.id)
+        session.add(edge)
+        await session.flush()
+        return {"id": str(edge.id), "src": str(edge.src_id), "dst": str(edge.dst_id), "type": etype.name, "derived": False}
+
+
+@app.delete("/edges/{edge_id}", status_code=204)
+async def delete_edge(edge_id: str):
+    async with db_session() as session:
+        edge = await session.get(DbEdge, uuid.UUID(edge_id))
+        if not edge:
+            raise HTTPException(status_code=404, detail="Edge not found")
+        await session.delete(edge)
 
 
 @app.get("/runs/{run_id}/events")
@@ -336,7 +467,8 @@ async def chat(body: ChatRequest):
             async with db_session() as session:
                 spec = await load_spec(session, uuid.UUID(body.agent_id))
                 agent_entity_id = await get_agent_entity_id(session, spec.id)
-                run_ctx = await begin_run(session, body.message, spec, agent_entity_id)
+                task_uuid = uuid.UUID(body.task_id) if body.task_id else None
+                run_ctx = await begin_run(session, body.message, spec, agent_entity_id, task_id=task_uuid)
 
             streaming_hook = await _make_streaming_hook(queue)
 
@@ -357,6 +489,14 @@ async def chat(body: ChatRequest):
                         await queue.put(("message", {"role": "agent", "content": text}))
 
             async with db_session() as session:
+                session.add(
+                    DbMessage(
+                        run_id=run_ctx.run_id,
+                        role="user",
+                        content={"text": body.message, "tool_calls": []},
+                    )
+                )
+                await session.flush()
                 for sdk_msg in sdk_messages:
                     if isinstance(sdk_msg, AssistantMessage):
                         text = " ".join(
@@ -374,13 +514,6 @@ async def chat(body: ChatRequest):
                                 content={"text": text, "tool_calls": tool_calls},
                             )
                         )
-                session.add(
-                    DbMessage(
-                        run_id=run_ctx.run_id,
-                        role="user",
-                        content={"text": body.message, "tool_calls": []},
-                    )
-                )
                 await end_run(session, run_ctx, sdk_messages)
 
             await queue.put(
@@ -462,7 +595,6 @@ class UpdateAgentRequest(BaseModel):
 
 @app.patch("/agents/{agent_id}")
 async def update_agent(agent_id: str, body: UpdateAgentRequest):
-    from fastapi import HTTPException
     from builder_agent import capabilities_to_tools
     async with db_session() as session:
         spec = await session.get(DbAgentSpec, uuid.UUID(agent_id))
@@ -476,3 +608,95 @@ async def update_agent(agent_id: str, body: UpdateAgentRequest):
             spec.allowed_tools = capabilities_to_tools(body.capabilities)
         await session.flush()
         return _spec_to_dict(spec)
+
+
+@app.delete("/agents/{agent_id}", status_code=204)
+async def delete_agent(agent_id: str):
+    async with db_session() as session:
+        spec = await session.get(DbAgentSpec, uuid.UUID(agent_id))
+        if not spec:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        await session.delete(spec)
+
+
+# ---------------------------------------------------------------------------
+# Policy CRUD
+# ---------------------------------------------------------------------------
+
+def _policy_row(p: DbPolicyRule) -> dict:
+    return {
+        "id": str(p.id),
+        "name": p.name,
+        "tool_pattern": p.tool_pattern,
+        "subject_key": p.subject_key,
+        "subject_type": p.subject_type,
+        "blocking_conditions": p.blocking_conditions or [],
+        "enabled": p.enabled,
+        "created_at": p.created_at.isoformat(),
+    }
+
+
+@app.get("/policies")
+async def list_policies():
+    async with db_session() as session:
+        rows = (await session.execute(select(DbPolicyRule).order_by(DbPolicyRule.created_at))).scalars().all()
+        return [_policy_row(r) for r in rows]
+
+
+class BlockingConditionModel(BaseModel):
+    edge_type: str
+    target_type: str | None = None
+    blocking_target_states: dict[str, list[Any]] = {}
+    message_template: str = "{subject} has active {edge_type} relationship(s)"
+
+
+class CreatePolicyRequest(BaseModel):
+    name: str
+    tool_pattern: str
+    subject_key: str
+    subject_type: str
+    blocking_conditions: list[BlockingConditionModel] = []
+
+
+@app.post("/policies", status_code=201)
+async def create_policy(body: CreatePolicyRequest):
+    async with db_session() as session:
+        rule = DbPolicyRule(
+            name=body.name,
+            tool_pattern=body.tool_pattern,
+            subject_key=body.subject_key,
+            subject_type=body.subject_type,
+            blocking_conditions=[c.model_dump() for c in body.blocking_conditions],
+            enabled=True,
+        )
+        session.add(rule)
+        await session.flush()
+        return _policy_row(rule)
+
+
+class UpdatePolicyRequest(BaseModel):
+    enabled: bool | None = None
+    name: str | None = None
+
+
+@app.patch("/policies/{policy_id}")
+async def update_policy(policy_id: str, body: UpdatePolicyRequest):
+    async with db_session() as session:
+        rule = await session.get(DbPolicyRule, uuid.UUID(policy_id))
+        if not rule:
+            raise HTTPException(status_code=404, detail="Policy not found")
+        if body.enabled is not None:
+            rule.enabled = body.enabled
+        if body.name is not None:
+            rule.name = body.name
+        await session.flush()
+        return _policy_row(rule)
+
+
+@app.delete("/policies/{policy_id}", status_code=204)
+async def delete_policy(policy_id: str):
+    async with db_session() as session:
+        rule = await session.get(DbPolicyRule, uuid.UUID(policy_id))
+        if not rule:
+            raise HTTPException(status_code=404, detail="Policy not found")
+        await session.delete(rule)
