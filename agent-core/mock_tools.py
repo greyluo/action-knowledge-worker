@@ -202,6 +202,25 @@ async def remember_entity(args: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(args)}]}
 
 
+async def _execute_query_graph(args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from query_graph import execute_query_graph  # noqa: PLC0415
+
+        result = await execute_query_graph(
+            entity_type=args.get("entity_type"),
+            properties=args.get("properties"),
+            related_to=args.get("related_to"),
+            edge_types=args.get("edge_types"),
+            max_hops=args.get("max_hops", 1),
+            apply_inference=args.get("apply_inference", True),
+        )
+    except ImportError:
+        result = {"error": "query_graph not available"}
+    return {"content": [{"type": "text", "text": json.dumps(result)}]}
+
+
+# Module-level reference used by api.py /tools for schema introspection only.
+# Policy enforcement happens inside make_demo_server(run_ctx) at runtime.
 @tool(
     "query_graph",
     (
@@ -220,20 +239,7 @@ async def remember_entity(args: dict[str, Any]) -> dict[str, Any]:
     annotations=ToolAnnotations(readOnlyHint=True),
 )
 async def query_graph_tool(args: dict[str, Any]) -> dict[str, Any]:
-    try:
-        from query_graph import execute_query_graph  # noqa: PLC0415 — lazy import
-
-        result = await execute_query_graph(
-            entity_type=args.get("entity_type"),
-            properties=args.get("properties"),
-            related_to=args.get("related_to"),
-            edge_types=args.get("edge_types"),
-            max_hops=args.get("max_hops", 1),
-            apply_inference=args.get("apply_inference", True),
-        )
-    except ImportError:
-        result = {"error": "query_graph not available"}
-    return {"content": [{"type": "text", "text": json.dumps(result)}]}
+    return await _execute_query_graph(args)
 
 
 # ---------------------------------------------------------------------------
@@ -273,8 +279,16 @@ async def _run_child_agent(
     options = build_options_from_spec(spec, run_ctx, permission_mode="bypassPermissions")
 
     sdk_messages: list = []
-    async for msg in query(prompt=task_prompt, options=options):
-        sdk_messages.append(msg)
+    try:
+        async for msg in query(prompt=task_prompt, options=options):
+            sdk_messages.append(msg)
+    except Exception as exc:
+        import logging as _log  # noqa: PLC0415
+        _log.getLogger(__name__).error(
+            "[child agent %s] query() failed: %s", to_agent_spec_id, exc, exc_info=True
+        )
+        print(f"\n[chain ERROR] child agent {to_agent_spec_id} query failed: {exc}", flush=True)
+        raise
 
     async with db_session() as session:
         from sqlalchemy import select as _select  # noqa: PLC0415
@@ -497,6 +511,35 @@ async def _delegate_task_impl(args: dict, run_ctx, *, _session=None) -> dict:
 
 def make_demo_server(run_ctx=None):
     """Create an MCP server. If run_ctx provided, includes delegate_task."""
+
+    @tool(
+        "query_graph",
+        (
+            "Query Ontology for typed entities and their relationships. "
+            "Use this to look up previously discovered companies, people, deals, and tasks "
+            "before making decisions."
+        ),
+        {
+            "entity_type": str,
+            "properties": dict,
+            "related_to": str,
+            "edge_types": list,
+            "max_hops": int,
+            "apply_inference": bool,
+        },
+        annotations=ToolAnnotations(readOnlyHint=True),
+    )
+    async def query_graph_tool(args: dict[str, Any]) -> dict[str, Any]:
+        if run_ctx is not None:
+            from policies import check_policies  # noqa: PLC0415
+            try:
+                reason = await check_policies("mcp__demo__query_graph", args, run_ctx)
+            except Exception:
+                reason = "Policy check failed; action blocked for safety."
+            if reason:
+                return {"content": [{"type": "text", "text": json.dumps({"error": f"Policy blocked: {reason}"})}]}
+        return await _execute_query_graph(args)
+
     tools_list = [
         fetch_company_data,
         fetch_email_thread,

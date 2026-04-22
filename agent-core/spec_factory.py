@@ -30,13 +30,30 @@ async def get_agent_entity_id(session: AsyncSession, spec_id: uuid.UUID) -> uuid
     agent_type = await session.scalar(
         select(OntologyType).where(OntologyType.name == "Agent")
     )
+    if not agent_type:
+        return uuid.uuid4()
+
     agent = await session.scalar(
         select(Entity).where(
             Entity.type_id == agent_type.id,
             Entity.properties["spec_id"].astext == str(spec_id),
         )
     )
-    return agent.id if agent else uuid.uuid4()
+    if agent:
+        return agent.id
+
+    # No entity yet — create it so the agent has a real graph identity.
+    # Without this, actor-mode policies would find no subject and skip enforcement.
+    spec = await session.get(AgentSpec, spec_id)
+    name = spec.name if spec else str(spec_id)[:8]
+    agent = Entity(
+        type_id=agent_type.id,
+        properties={"spec_id": str(spec_id), "name": name},
+        source_refs=[{"source": "auto_created"}],
+    )
+    session.add(agent)
+    await session.flush()
+    return agent.id
 
 
 async def begin_run(
@@ -246,14 +263,14 @@ def build_options_from_spec(
         try:
             reason = await check_policies(tool_name, tool_input_val or {}, run_ctx)
         except Exception as exc:
-            _logger.exception("policy check failed for tool %s: %s", tool_name, exc)
-            return {}
+            _logger.exception("policy check failed for tool %s — denying to fail closed: %s", tool_name, exc)
+            reason = "Policy check failed; action blocked for safety."
 
         if reason:
             _logger.info("Policy blocked %s: %s", tool_name, reason)
             return {
                 "systemMessage": (
-                    f"Action blocked by policy: {reason} "
+                    f"Action blocked by policy: {reason}. "
                     "Explain this blocking reason to the requester and do not retry."
                 ),
                 "hookSpecificOutput": {
