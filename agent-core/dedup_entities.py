@@ -21,7 +21,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db import Edge, Entity, OntologyEvent, OntologyType, db_session
+from db import Delegation, Edge, Entity, OntologyEvent, OntologyType, db_session
 
 
 def _canonical_key(ct: OntologyType) -> list[str] | None:
@@ -104,30 +104,52 @@ async def dedup(session: AsyncSession, dry_run: bool = False) -> None:
             print(f"  Drop  : {d.id} props={list(d.properties or {})}")
 
         if not dry_run:
-            # Update edges pointing to/from duplicates → primary
-            await session.execute(
-                update(Edge).where(Edge.src_id.in_(dup_ids)).values(src_id=primary.id)
-            )
-            await session.execute(
-                update(Edge).where(Edge.dst_id.in_(dup_ids)).values(dst_id=primary.id)
-            )
-            # Remove now-duplicate edges (same src/dst/type)
-            all_edges = (await session.execute(select(Edge).where(
-                Edge.src_id == primary.id
-            ))).scalars().all()
-            seen_edges: set[tuple] = set()
-            for edge in all_edges:
-                sig = (edge.src_id, edge.dst_id, edge.edge_type_id)
-                if sig in seen_edges:
-                    await session.delete(edge)
-                else:
-                    seen_edges.add(sig)
+            # Re-point edges one-by-one, deleting any that would violate the unique constraint
+            for dup_id in dup_ids:
+                src_edges = (await session.execute(
+                    select(Edge).where(Edge.src_id == dup_id)
+                )).scalars().all()
+                for edge in src_edges:
+                    conflict = await session.scalar(
+                        select(Edge).where(
+                            Edge.src_id == primary.id,
+                            Edge.dst_id == edge.dst_id,
+                            Edge.edge_type_id == edge.edge_type_id,
+                        )
+                    )
+                    if conflict:
+                        await session.delete(edge)
+                    else:
+                        edge.src_id = primary.id
+
+                dst_edges = (await session.execute(
+                    select(Edge).where(Edge.dst_id == dup_id)
+                )).scalars().all()
+                for edge in dst_edges:
+                    conflict = await session.scalar(
+                        select(Edge).where(
+                            Edge.src_id == edge.src_id,
+                            Edge.dst_id == primary.id,
+                            Edge.edge_type_id == edge.edge_type_id,
+                        )
+                    )
+                    if conflict:
+                        await session.delete(edge)
+                    else:
+                        edge.dst_id = primary.id
 
             # Reassign OntologyEvents
             await session.execute(
                 update(OntologyEvent)
                 .where(OntologyEvent.entity_id.in_(dup_ids))
                 .values(entity_id=primary.id)
+            )
+
+            # Re-point delegations referencing duplicates → primary
+            await session.execute(
+                update(Delegation)
+                .where(Delegation.task_entity_id.in_(dup_ids))
+                .values(task_entity_id=primary.id)
             )
 
             # Update primary with merged props
@@ -193,6 +215,11 @@ async def purge_ghosts(session: AsyncSession, dry_run: bool = False) -> None:
             update(OntologyEvent)
             .where(OntologyEvent.entity_id.in_(ghost_ids))
             .values(entity_id=None)
+        )
+        await session.execute(
+            update(Delegation)
+            .where(Delegation.task_entity_id.in_(ghost_ids))
+            .values(task_entity_id=None)
         )
         await session.execute(delete(Entity).where(Entity.id.in_(ghost_ids)))
         await session.commit()
