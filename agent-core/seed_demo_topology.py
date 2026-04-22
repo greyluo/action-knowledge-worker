@@ -71,10 +71,9 @@ DEMO_AGENTS = [
         "system_prompt": (
             "You are a Writer Agent. You receive analysis entities from a prior agent via the graph. "
             "Step 1: call query_graph to load your context entities (use the IDs provided in your context). "
-            "Step 2: call remember_entity EXACTLY ONCE with type_hint='Report' and these fields: "
-            "title (string), summary (string, 2-3 paragraphs for a non-technical stakeholder), "
-            "risk_rating (string), recommended_actions (list of strings). "
-            "You MUST call remember_entity — do NOT just write the report as text. "
+            "Step 2: write the report as text in your final message — covering deal overview, risk assessment, "
+            "stakeholder summary, and recommended actions (250-400 words, professional tone). "
+            "Do NOT call remember_entity — reports and artifacts are not saved to the ontology. "
             "Step 3: finish with OUTCOME_SUMMARY: <report title>."
         ),
         "allowed_tools": [

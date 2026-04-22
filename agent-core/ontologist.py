@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import anthropic
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db import Edge, EdgeType, Entity, OntologyEvent, OntologyType, db_session
@@ -46,6 +46,24 @@ class ExtractionResult(BaseModel):
     relationships: list[CandidateRelationship]
     removed_relationships: list[CandidateRelationship] = []
     modified_relationships: list[CandidateRelationshipChange] = []
+
+
+class MutationEdge(BaseModel):
+    src_id: str
+    dst_id: str
+    label: str
+
+
+class MutationChange(BaseModel):
+    src_id: str
+    dst_id: str
+    old_label: str
+    new_label: str
+
+
+class EdgeMutationResult(BaseModel):
+    removed_edges: list[MutationEdge] = []
+    modified_edges: list[MutationChange] = []
 
 
 class TypeMatchResult(BaseModel):
@@ -115,13 +133,20 @@ Return ONLY valid JSON matching this schema — no markdown, no explanation:
 }
 Rules:
 - Extract every distinct named entity with a stable real-world identity: people, organizations, products, locations, events, documents, roles, concepts — anything trackable across sources.
-- Include all properties present in the data (emails, IDs, URLs, titles, statuses, dates, etc.).
+- Include only short metadata fields: name, email, domain, id, url, status, role, date, title (max ~80 chars). ALWAYS include "name" in properties.
+- NEVER copy large text content into properties: no descriptions, summaries, report prose, body text, or any string longer than 200 characters.
 - Use type_hint to suggest the most specific type that fits (e.g. "Person", "Company", "Product", "Location"). Use null if uncertain.
 - Do NOT extract generic values like counts, boolean flags, or raw dates as entities.
 - Do NOT extract system/infrastructure entities — never set type_hint to Task, Run, Agent, or Entity.
 - Do NOT extract tool names or API identifiers as entities (e.g. strings like "mcp__demo__query_graph" or anything matching the pattern mcp__*__*).
 - For all relationship lists, only include pairs where both src and dst are in your entities list.
 - For relationship labels, reuse an existing label from the ontology context when it fits. Only invent a new label if no existing one is semantically correct.
+
+Existing entity matching (critical — prevents duplicates):
+- The ontology context includes an "Existing entities" section listing already-known entities with their key identifiers.
+- If an entity in the tool output matches an existing entity (same name, email, domain, or other key identifier), you MUST include that entity's key identifiers verbatim in its properties. For example, if an existing Person has email "alice@example.com", use exactly that email string so the system can deduplicate.
+- Treat name variants as the same entity: "Acme Corp" and "Acme Corporation" are the same if they share a domain or other identifier.
+- Entity names must be the canonical real-world name of the thing itself — NOT the title of a document, report, or analysis about it. Write "Acme Renewal 2026" not "Acme Renewal 2026 — Analyst Assessment". The report title belongs in a separate "title" or "description" property, not as the entity's name.
 
 Relationship operation rules:
 - relationships: edges that currently hold and should be created if absent.
@@ -276,6 +301,64 @@ Return the edge semantics JSON:"""
     return {"is_transitive": False, "is_inverse_of": None, "domain": None, "range_": None}
 
 
+EDGE_MUTATION_SYSTEM = """You decide which existing graph edges should be removed or changed based on new information from a tool output.
+Return ONLY valid JSON — no markdown, no explanation:
+{
+  "removed_edges": [
+    {"src_id": "<uuid>", "dst_id": "<uuid>", "label": "<exact existing edge label>"}
+  ],
+  "modified_edges": [
+    {"src_id": "<uuid>", "dst_id": "<uuid>", "old_label": "<exact existing label>", "new_label": "<replacement label>"}
+  ]
+}
+
+Rules:
+- Only reference edges that appear in the "Existing edges" list. Copy src_id, dst_id, and label exactly.
+- removed_edges: the relationship no longer holds due to a state change. Example: book status changed to "available" → remove the "borrows" edge FROM the person TO the book.
+- modified_edges: the connection still exists but the relationship type should evolve. Example: "borrows" → "has_read" after a book is returned — preserving the person-book link with a past-tense meaning.
+- Use remove when the connection itself is gone. Use modify when the connection remains but its nature changed.
+- If no changes are needed, return {"removed_edges": [], "modified_edges": []}.
+"""
+
+
+async def llm_mutate_edges(
+    tool_output: Any,
+    existing_edges: list[dict],
+) -> EdgeMutationResult:
+    """Given tool output and the current graph edges touching resolved entities,
+    return which edges to remove or modify.
+
+    existing_edges items: {src_id, src_name, src_type, label, dst_id, dst_name, dst_type}
+    """
+    edge_lines = "\n".join(
+        f'- src_id={e["src_id"]} ({e["src_name"]}, {e["src_type"]}) --{e["label"]}--> '
+        f'dst_id={e["dst_id"]} ({e["dst_name"]}, {e["dst_type"]})'
+        for e in existing_edges
+    )
+    prompt = f"""Existing edges:
+{edge_lines}
+
+Tool output that may imply edge changes:
+{json.dumps(tool_output, default=str)[:3000]}
+
+Return the edge mutation JSON:"""
+
+    raw = ""
+    for attempt in range(2):
+        try:
+            resp = await anthropic_client.messages.create(
+                model=JUDGE_MODEL,
+                max_tokens=512,
+                system=EDGE_MUTATION_SYSTEM,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = resp.content[0].text
+            return EdgeMutationResult.model_validate_json(_strip_fences(raw))
+        except (ValidationError, json.JSONDecodeError, IndexError) as e:
+            logger.warning("llm_mutate_edges parse failure attempt %d: %s | raw=%r", attempt, e, raw)
+    return EdgeMutationResult()
+
+
 async def llm_edge_type_normalize(label: str, existing_types: list[dict]) -> str | None:
     """Return an existing canonical edge type name if label is semantically equivalent, else None."""
     if not existing_types:
@@ -359,6 +442,11 @@ _REMEMBER_ENTITY_TOOLS = {"remember_entity", "mcp__demo__remember_entity"}
 _SKIP_TOOLS = {"query_graph", "mcp__demo__query_graph"}
 
 _TOOL_NAME_RE = re.compile(r"^mcp__\w+__\w+$")
+_ALL_TOOL_NAMES = _REMEMBER_ENTITY_TOOLS | _SKIP_TOOLS
+
+
+def _is_tool_name(s: str) -> bool:
+    return bool(s and (s in _ALL_TOOL_NAMES or _TOOL_NAME_RE.match(s)))
 
 
 async def _ontologist_step_inner(
@@ -374,27 +462,22 @@ async def _ontologist_step_inner(
     ontology_summary = await _get_ontology_summary(session)
 
     if tool_name in _REMEMBER_ENTITY_TOOLS:
-        # Use tool_input as the source document so llm_extract can infer
-        # relationships from properties (e.g. employer → works_at edge).
-        # Fall back to single structured entity if LLM finds nothing.
-        extraction = await llm_extract(tool_input, ontology_summary)
-        if not extraction.entities:
-            extraction = ExtractionResult(
-                entities=[CandidateEntity(
-                    name=tool_input.get("name", ""),
-                    type_hint=tool_input.get("type_hint"),
-                    properties=tool_input.get("properties") or {},
-                )],
-                relationships=[],
-            )
-        # Guarantee the primary entity has name in properties — the top-level
-        # "name" arg from remember_entity isn't always carried into properties
-        # by llm_extract, breaking future name-based lookups.
-        primary_name = tool_input.get("name")
-        if primary_name and extraction.entities:
-            first = extraction.entities[0]
-            if not first.properties.get("name"):
-                first.properties = {**first.properties, "name": primary_name}
+        # Trust the agent's explicit intent — use tool_input directly.
+        # llm_extract would re-parse the name string and pull out unrelated named
+        # entities (e.g. "Acme Corp" from a report title) instead of the Report
+        # itself. The agent already knows what entity it wants to save.
+        props = dict(tool_input.get("properties") or {})
+        primary_name = tool_input.get("name", "")
+        if primary_name and not props.get("name"):
+            props["name"] = primary_name
+        extraction = ExtractionResult(
+            entities=[CandidateEntity(
+                name=primary_name,
+                type_hint=tool_input.get("type_hint"),
+                properties=props,
+            )],
+            relationships=[],
+        )
     else:
         extraction = await llm_extract(tool_output, ontology_summary)
 
@@ -405,25 +488,40 @@ async def _ontologist_step_inner(
 
     existing_types = await _get_all_types(session)
     result = OntologyStepResult()
-    resolved_ids = result.entity_ids  # alias — same list, index used for relationship resolution
+    resolved_ids = result.entity_ids  # kept for OntologyStepResult compatibility
+    resolved_by_idx: dict[int, uuid.UUID] = {}  # candidate index → resolved entity id
     resolved_names: dict[uuid.UUID, str] = {}
 
-    for cand in extraction.entities:
+    for idx, cand in enumerate(extraction.entities):
         if cand.type_hint in _SYSTEM_TYPE_NAMES:
             logger.debug("Skipping candidate %r with system type_hint %r", cand.name, cand.type_hint)
             continue
-        if _TOOL_NAME_RE.match(cand.name):
-            logger.debug("Skipping candidate %r — looks like a tool name", cand.name)
+        if _is_tool_name(cand.name) or _is_tool_name(cand.type_hint or ""):
+            logger.debug("Skipping candidate %r — name or type_hint is a tool name", cand.name)
             continue
+
+        # Always ensure the display name is stored in properties so every lookup path can find it.
+        if cand.name and not cand.properties.get("name"):
+            cand.properties = {**cand.properties, "name": cand.name}
+
         match = await llm_type_match(cand, existing_types)
 
         if match.decision == "REUSE" and match.type_id:
             type_id = uuid.UUID(match.type_id)
         else:
-            type_id, type_created = await _persist_type(session, match.proposed or {}, run_ctx)
-            existing_types = await _get_all_types(session)
+            proposed = match.proposed or {}
+            type_id, type_created = await _persist_type(session, proposed, run_ctx)
             if type_created:
-                result.new_types.append(match.proposed.get("name", "Unknown") if match.proposed else "Unknown")
+                proposed_name = proposed.get("name", "Unknown")
+                result.new_types.append(proposed_name)
+                existing_types.append({
+                    "id": str(type_id),
+                    "name": proposed_name,
+                    "parent_name": proposed.get("parent", "Entity"),
+                    "fields": proposed.get("fields", {}),
+                    "canonical_key": proposed.get("canonical_key"),
+                    "description": proposed.get("description", ""),
+                })
 
         type_name = next((t["name"] for t in existing_types if t["id"] == str(type_id)), str(type_id)[:8])
 
@@ -449,13 +547,16 @@ async def _ontologist_step_inner(
             existing = await _find_by_name(session, type_id, cand.properties["name"])
         if existing is None and cand.properties.get("title"):
             existing = await _find_by_title(session, type_id, cand.properties["title"])
+        if existing is None and cand.properties.get("name"):
+            existing = await _find_by_fuzzy_name(session, type_id, cand.properties["name"])
         if existing is None:
             existing = await _find_by_any_string_overlap(session, type_id, cand.properties)
         if existing:
-            existing.properties = {**existing.properties, **cand.properties}
+            existing.properties = _trim_properties({**existing.properties, **cand.properties})
             existing.source_refs = existing.source_refs + [
                 {"tool": tool_name, "input": str(tool_input)[:200]}
             ]
+            resolved_by_idx[idx] = existing.id
             resolved_ids.append(existing.id)
             resolved_names[existing.id] = cand.name
             result.changes.append({"action": "updated", "type_name": type_name, "name": cand.name, "id": existing.id})
@@ -463,13 +564,14 @@ async def _ontologist_step_inner(
 
         entity = Entity(
             type_id=type_id,
-            properties=cand.properties,
+            properties=_trim_properties(cand.properties),
             source_refs=[{"tool": tool_name, "input": str(tool_input)[:200]}],
             created_by_agent_id=run_ctx.agent_entity_id,
             created_in_run_id=run_ctx.run_id,
         )
         session.add(entity)
         await session.flush()
+        resolved_by_idx[idx] = entity.id
         resolved_ids.append(entity.id)
         resolved_names[entity.id] = cand.name
         result.changes.append({"action": "created", "type_name": type_name, "name": cand.name, "id": entity.id})
@@ -485,11 +587,11 @@ async def _ontologist_step_inner(
     type_id_to_name = {t["id"]: t["name"] for t in existing_types}
 
     for rel in extraction.relationships:
-        if rel.src_idx < len(resolved_ids) and rel.dst_idx < len(resolved_ids):
+        src_id = resolved_by_idx.get(rel.src_idx)
+        dst_id = resolved_by_idx.get(rel.dst_idx)
+        if src_id is not None and dst_id is not None:
             et = await _resolve_edge_type(session, rel.label, run_ctx, existing_types)
             if et:
-                src_id = resolved_ids[rel.src_idx]
-                dst_id = resolved_ids[rel.dst_idx]
                 if et.domain or et.range_:
                     src_ent = await session.get(Entity, src_id)
                     dst_ent = await session.get(Entity, dst_id)
@@ -501,48 +603,12 @@ async def _ontologist_step_inner(
                         dst_type = type_id_to_name.get(str(dst_ent.type_id))
                         if dst_type and dst_type != et.range_:
                             logger.warning("Edge %s range violation: dst=%s expected=%s", rel.label, dst_type, et.range_)
-                # Check exact match first
-                exists = await session.scalar(
-                    select(Edge).where(
-                        Edge.src_id == src_id,
-                        Edge.dst_id == dst_id,
-                        Edge.edge_type_id == et.id,
-                    )
-                )
-                if not exists:
-                    # Also skip if a semantically equivalent edge already exists between this pair
-                    existing_pair_edges = (
-                        await session.execute(
-                            select(Edge, EdgeType)
-                            .join(EdgeType, Edge.edge_type_id == EdgeType.id)
-                            .where(Edge.src_id == src_id, Edge.dst_id == dst_id)
-                        )
-                    ).all()
-                    if existing_pair_edges:
-                        existing_type_names = [{"name": etype.name} for _, etype in existing_pair_edges]
-                        canonical = await llm_edge_type_normalize(et.name, existing_type_names)
-                        if canonical:
-                            logger.info(
-                                "Skipping edge %r: semantically equivalent to existing %r between %s→%s",
-                                et.name, canonical, str(src_id)[:8], str(dst_id)[:8],
-                            )
-                            exists = True
-                if not exists:
-                    session.add(Edge(
-                        src_id=src_id,
-                        dst_id=dst_id,
-                        edge_type_id=et.id,
-                        created_by_agent_id=run_ctx.agent_entity_id,
-                        created_in_run_id=run_ctx.run_id,
-                    ))
-                    src_name = resolved_names.get(src_id, str(src_id)[:8])
-                    dst_name = resolved_names.get(dst_id, str(dst_id)[:8])
-                    result.new_edges.append({"src": src_name, "label": rel.label, "dst": dst_name})
+                await _add_edge_if_new(session, src_id, dst_id, et, run_ctx, resolved_names, result)
 
     for rel in extraction.removed_relationships:
-        if rel.src_idx < len(resolved_ids) and rel.dst_idx < len(resolved_ids):
-            src_id = resolved_ids[rel.src_idx]
-            dst_id = resolved_ids[rel.dst_idx]
+        src_id = resolved_by_idx.get(rel.src_idx)
+        dst_id = resolved_by_idx.get(rel.dst_idx)
+        if src_id is not None and dst_id is not None:
             et = await session.scalar(select(EdgeType).where(EdgeType.name == rel.label))
             if et:
                 edge = await session.scalar(
@@ -565,43 +631,242 @@ async def _ontologist_step_inner(
                     ))
 
     for rel in extraction.modified_relationships:
-        if rel.src_idx < len(resolved_ids) and rel.dst_idx < len(resolved_ids):
-            src_id = resolved_ids[rel.src_idx]
-            dst_id = resolved_ids[rel.dst_idx]
+        src_id = resolved_by_idx.get(rel.src_idx)
+        dst_id = resolved_by_idx.get(rel.dst_idx)
+        if src_id is not None and dst_id is not None:
             old_et = await session.scalar(select(EdgeType).where(EdgeType.name == rel.old_label))
             new_et = await _resolve_edge_type(session, rel.new_label, run_ctx, existing_types)
             if old_et and new_et:
-                edge = await session.scalar(
-                    select(Edge).where(
-                        Edge.src_id == src_id,
-                        Edge.dst_id == dst_id,
-                        Edge.edge_type_id == old_et.id,
-                    )
+                await _apply_edge_modify(
+                    session, src_id, dst_id, old_et, new_et,
+                    rel.old_label, rel.new_label, run_ctx,
+                    resolved_names.get(src_id, str(src_id)[:8]),
+                    resolved_names.get(dst_id, str(dst_id)[:8]),
+                    result,
                 )
-                if edge:
-                    edge.edge_type_id = new_et.id
-                    src_name = resolved_names.get(src_id, str(src_id)[:8])
-                    dst_name = resolved_names.get(dst_id, str(dst_id)[:8])
-                    result.modified_edges.append({
-                        "src": src_name, "old_label": rel.old_label,
-                        "new_label": rel.new_label, "dst": dst_name,
-                    })
-                    session.add(OntologyEvent(
-                        event_type="edge_modified",
-                        actor=f"agent:{run_ctx.agent_entity_id}",
-                        entity_id=src_id,
-                        payload={"old_label": rel.old_label, "new_label": rel.new_label, "dst_id": str(dst_id)},
-                    ))
+
+    # Second pass: fetch edges from both directions for all resolved entities and
+    # ask the LLM whether any should be removed or retyped. This catches edges
+    # pointing TO a resolved entity from entities not present in the current
+    # tool output (e.g. Grey --borrows--> Flowers when only Flowers was returned).
+    if resolved_ids:
+        graph_edges = await _get_entity_edges(session, resolved_ids)
+        if graph_edges:
+            mutations = await llm_mutate_edges(tool_output, graph_edges)
+            await _apply_edge_mutations(session, mutations, run_ctx, existing_types, resolved_names, result)
 
     return result
+
+
+_SUMMARY_SYSTEM_TYPES = {"Task", "Run", "Agent", "Entity"}
+_SUMMARY_ID_FIELDS = {"name", "email", "domain", "title", "id", "url"}
+
+
+async def _get_entity_edges(
+    session: AsyncSession,
+    entity_ids: list[uuid.UUID],
+) -> list[dict]:
+    """Return all edges where any of the given entities is src or dst, with names and types."""
+    rows = (await session.execute(
+        select(Edge, EdgeType)
+        .join(EdgeType, Edge.edge_type_id == EdgeType.id)
+        .where(or_(Edge.src_id.in_(entity_ids), Edge.dst_id.in_(entity_ids)))
+    )).all()
+    if not rows:
+        return []
+
+    all_ids = {edge.src_id for edge, _ in rows} | {edge.dst_id for edge, _ in rows}
+    entity_rows = (await session.execute(
+        select(Entity, OntologyType)
+        .join(OntologyType, Entity.type_id == OntologyType.id)
+        .where(Entity.id.in_(all_ids))
+    )).all()
+    entity_info: dict[uuid.UUID, dict] = {}
+    for ent, otype in entity_rows:
+        p = ent.properties or {}
+        entity_info[ent.id] = {
+            "name": p.get("name") or p.get("title") or str(ent.id)[:8],
+            "type": otype.name,
+        }
+
+    return [
+        {
+            "src_id": str(edge.src_id),
+            "src_name": entity_info.get(edge.src_id, {}).get("name", str(edge.src_id)[:8]),
+            "src_type": entity_info.get(edge.src_id, {}).get("type", "?"),
+            "label": etype.name,
+            "dst_id": str(edge.dst_id),
+            "dst_name": entity_info.get(edge.dst_id, {}).get("name", str(edge.dst_id)[:8]),
+            "dst_type": entity_info.get(edge.dst_id, {}).get("type", "?"),
+        }
+        for edge, etype in rows
+    ]
+
+
+async def _add_edge_if_new(
+    session: AsyncSession,
+    src_id: uuid.UUID,
+    dst_id: uuid.UUID,
+    et: EdgeType,
+    run_ctx: RunContext,
+    resolved_names: dict[uuid.UUID, str],
+    result: OntologyStepResult,
+) -> bool:
+    """Add an edge only if no edge of any type already exists between src and dst.
+    Enforces one-edge-per-pair for stability. Returns True if the edge was added."""
+    existing_pair = (await session.execute(
+        select(Edge, EdgeType)
+        .join(EdgeType, Edge.edge_type_id == EdgeType.id)
+        .where(Edge.src_id == src_id, Edge.dst_id == dst_id)
+    )).all()
+    if existing_pair:
+        logger.info(
+            "Skipping edge %r: edge already exists between %s→%s (existing: %s)",
+            et.name, str(src_id)[:8], str(dst_id)[:8],
+            ", ".join(etype.name for _, etype in existing_pair),
+        )
+        return False
+    session.add(Edge(
+        src_id=src_id,
+        dst_id=dst_id,
+        edge_type_id=et.id,
+        created_by_agent_id=run_ctx.agent_entity_id,
+        created_in_run_id=run_ctx.run_id,
+    ))
+    result.new_edges.append({
+        "src": resolved_names.get(src_id, str(src_id)[:8]),
+        "label": et.name,
+        "dst": resolved_names.get(dst_id, str(dst_id)[:8]),
+    })
+    return True
+
+
+async def _apply_edge_modify(
+    session: AsyncSession,
+    src_id: uuid.UUID,
+    dst_id: uuid.UUID,
+    old_et: EdgeType,
+    new_et: EdgeType,
+    old_label: str,
+    new_label: str,
+    run_ctx: RunContext,
+    src_name: str,
+    dst_name: str,
+    result: OntologyStepResult,
+    extra_payload: dict | None = None,
+) -> None:
+    edge = await session.scalar(
+        select(Edge).where(Edge.src_id == src_id, Edge.dst_id == dst_id, Edge.edge_type_id == old_et.id)
+    )
+    if not edge:
+        return
+    target_exists = await session.scalar(
+        select(Edge).where(Edge.src_id == src_id, Edge.dst_id == dst_id, Edge.edge_type_id == new_et.id)
+    )
+    if target_exists:
+        await session.delete(edge)
+        result.removed_edges.append({"src": src_name, "label": old_label, "dst": dst_name})
+    else:
+        edge.edge_type_id = new_et.id
+        result.modified_edges.append({"src": src_name, "old_label": old_label, "new_label": new_label, "dst": dst_name})
+    payload: dict = {"old_label": old_label, "new_label": new_label, "dst_id": str(dst_id)}
+    if extra_payload:
+        payload.update(extra_payload)
+    session.add(OntologyEvent(
+        event_type="edge_modified",
+        actor=f"agent:{run_ctx.agent_entity_id}",
+        entity_id=src_id,
+        payload=payload,
+    ))
+
+
+async def _apply_edge_mutations(
+    session: AsyncSession,
+    mutations: EdgeMutationResult,
+    run_ctx: RunContext,
+    existing_types: list[dict],
+    resolved_names: dict[uuid.UUID, str],
+    result: OntologyStepResult,
+) -> None:
+    all_et_names = {m.label for m in mutations.removed_edges} | {m.old_label for m in mutations.modified_edges}
+    et_map: dict[str, EdgeType] = {}
+    if all_et_names:
+        ets = (await session.execute(select(EdgeType).where(EdgeType.name.in_(all_et_names)))).scalars().all()
+        et_map = {et.name: et for et in ets}
+
+    for m in mutations.removed_edges:
+        try:
+            src_id = uuid.UUID(m.src_id)
+            dst_id = uuid.UUID(m.dst_id)
+        except ValueError:
+            continue
+        et = et_map.get(m.label)
+        if not et:
+            continue
+        edge = await session.scalar(
+            select(Edge).where(Edge.src_id == src_id, Edge.dst_id == dst_id, Edge.edge_type_id == et.id)
+        )
+        if edge:
+            await session.delete(edge)
+            result.removed_edges.append({
+                "src": resolved_names.get(src_id, m.src_id[:8]),
+                "label": m.label,
+                "dst": resolved_names.get(dst_id, m.dst_id[:8]),
+            })
+            session.add(OntologyEvent(
+                event_type="edge_removed",
+                actor=f"agent:{run_ctx.agent_entity_id}",
+                entity_id=src_id,
+                payload={"label": m.label, "dst_id": str(dst_id), "via": "mutation_pass"},
+            ))
+
+    for m in mutations.modified_edges:
+        try:
+            src_id = uuid.UUID(m.src_id)
+            dst_id = uuid.UUID(m.dst_id)
+        except ValueError:
+            continue
+        old_et = et_map.get(m.old_label)
+        new_et = await _resolve_edge_type(session, m.new_label, run_ctx, existing_types)
+        if not old_et or not new_et:
+            continue
+        await _apply_edge_modify(
+            session, src_id, dst_id, old_et, new_et,
+            m.old_label, m.new_label, run_ctx,
+            resolved_names.get(src_id, m.src_id[:8]),
+            resolved_names.get(dst_id, m.dst_id[:8]),
+            result,
+            extra_payload={"via": "mutation_pass"},
+        )
 
 
 async def _get_ontology_summary(session: AsyncSession) -> str:
     types = (await session.execute(select(OntologyType))).scalars().all()
     edge_types = (await session.execute(select(EdgeType))).scalars().all()
-    type_lines = [f"- {t.name}: fields={t.fields}" for t in types]
+    type_lines = [
+        f"- {t.name}: fields={t.fields}, canonical_key={t.canonical_key}"
+        for t in types
+    ]
     edge_lines = [f"- {et.name}" for et in edge_types]
+
+    entity_lines: list[str] = []
+    for t in types:
+        if t.name in _SUMMARY_SYSTEM_TYPES:
+            continue
+        ents = (
+            await session.execute(
+                select(Entity).where(Entity.type_id == t.id).limit(8)
+            )
+        ).scalars().all()
+        for e in ents:
+            p = e.properties or {}
+            display = p.get("name") or p.get("title") or str(e.id)[:8]
+            id_props = {k: v for k, v in p.items() if k in _SUMMARY_ID_FIELDS}
+            entity_lines.append(f"  - {t.name}: {display} {id_props}")
+
     parts = ["Entity types:"] + type_lines + ["", "Known relationship labels (prefer these):"] + edge_lines
+    if entity_lines:
+        parts += ["", "Existing entities (match against these before creating new ones):"] + entity_lines
     return "\n".join(parts)
 
 
@@ -672,13 +937,25 @@ async def _find_by_canonical(
             )
         )
     fields = canonical
-    query = select(Entity).where(Entity.type_id == type_id)
-    for f in fields:
-        val = properties.get(f)
-        if not val:
-            return None
-        query = query.where(Entity.properties[f].astext == str(val))
-    return await session.scalar(query)
+    present = [(f, str(properties[f])) for f in fields if properties.get(f)]
+    if not present:
+        return None
+    # Full match when all canonical fields are available
+    if len(present) == len(fields):
+        query = select(Entity).where(Entity.type_id == type_id)
+        for f, val in present:
+            query = query.where(Entity.properties[f].astext == val)
+        result = await session.scalar(query)
+        if result:
+            return result
+    # Partial fallback: match on the first available canonical field
+    f, val = present[0]
+    return await session.scalar(
+        select(Entity).where(
+            Entity.type_id == type_id,
+            Entity.properties[f].astext == val,
+        )
+    )
 
 
 async def _find_by_name(
@@ -701,6 +978,51 @@ async def _find_by_title(
             Entity.properties["title"].astext == title,
         )
     )
+
+
+async def _find_by_fuzzy_name(
+    session: AsyncSession, type_id: uuid.UUID, name: str, threshold: float = 0.5
+) -> Entity | None:
+    """Fuzzy match using pg_trgm against both name and title — catches variant spellings and suffixes."""
+    from sqlalchemy import text
+    rows = (
+        await session.execute(
+            text(
+                "SELECT id FROM entities "
+                "WHERE type_id = :tid "
+                "AND GREATEST("
+                "    similarity(COALESCE(properties->>'name', ''), :name),"
+                "    similarity(COALESCE(properties->>'title', ''), :name)"
+                ") > :thr "
+                "ORDER BY GREATEST("
+                "    similarity(COALESCE(properties->>'name', ''), :name),"
+                "    similarity(COALESCE(properties->>'title', ''), :name)"
+                ") DESC "
+                "LIMIT 1"
+            ),
+            {"tid": str(type_id), "name": name, "thr": threshold},
+        )
+    ).all()
+    if rows:
+        return await session.get(Entity, uuid.UUID(str(rows[0][0])))
+    return None
+
+
+_PROPERTY_MAX_LEN = 200
+
+
+def _trim_properties(props: dict) -> dict:
+    """Drop or truncate any property value that exceeds the metadata size limit."""
+    out = {}
+    for k, v in props.items():
+        if isinstance(v, str) and len(v) > _PROPERTY_MAX_LEN:
+            out[k] = v[:_PROPERTY_MAX_LEN] + "…"
+        elif not isinstance(v, (str, int, float, bool)) and v is not None:
+            s = str(v)
+            out[k] = s[:_PROPERTY_MAX_LEN] + "…" if len(s) > _PROPERTY_MAX_LEN else s
+        else:
+            out[k] = v
+    return out
 
 
 _NON_IDENTITY_FIELDS = {"status", "description", "outcome_summary", "notes", "summary", "type", "industry", "role"}
