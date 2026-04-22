@@ -8,10 +8,10 @@ import {
   getAgents, getAgentTasks, getTaskMessages,
   getEntities, getEdges, getRuns,
   getEntityTypes, getEdgeTypes,
-  getPolicies, deleteTask,
+  getPolicies, getTools, deleteTask,
   streamChat,
 } from './api'
-import type { AgentSpec, Message, Task, Entity, Edge, Run, EntityType, EdgeType, Policy } from './types'
+import type { AgentSpec, Message, Task, Entity, Edge, Run, EntityType, EdgeType, Policy, ToolDef } from './types'
 import './styles/tokens.css'
 import './App.css'
 
@@ -32,6 +32,7 @@ export default function App() {
   const [entityTypes, setEntityTypes] = useState<EntityType[]>([])
   const [edgeTypes, setEdgeTypes] = useState<EdgeType[]>([])
   const [policies, setPolicies] = useState<Policy[]>([])
+  const [tools, setTools] = useState<ToolDef[]>([])
   const [isAgentStreaming, setIsAgentStreaming] = useState(false)
 
   useEffect(() => {
@@ -44,6 +45,7 @@ export default function App() {
     getEdgeTypes().then(setEdgeTypes).catch(console.error)
     getRuns().then(setRuns).catch(console.error)
     getPolicies().then(setPolicies).catch(console.error)
+    getTools().then(setTools).catch(console.error)
   }, [])
 
   useEffect(() => {
@@ -68,10 +70,12 @@ export default function App() {
   const selectedAgent = agents.find((a) => a.id === selectedAgentId) ?? agents[0]
   const currentMessages = messages[selectedTaskId] ?? []
 
-  const taskRunIds = new Set(runs.filter((r) => r.task_id === selectedTaskId).map((r) => r.id))
+  const taskRuns = runs.filter((r) => r.task_id === selectedTaskId)
+  const taskRunIds = new Set(taskRuns.map((r) => r.id))
   const taskEntities = selectedTaskId
     ? entities.filter((e) => e.created_in_run_id && taskRunIds.has(e.created_in_run_id))
     : []
+  const currentRunId = taskRuns.length > 0 ? taskRuns[taskRuns.length - 1].id : undefined
 
   const refreshOntology = useCallback(() => {
     getEntities().then(setEntities).catch(console.error)
@@ -178,6 +182,7 @@ export default function App() {
             messages={currentMessages}
             entities={taskEntities}
             isStreaming={isAgentStreaming}
+            currentRunId={currentRunId}
             onTaskSelect={(id) => setSelectedTaskIds((prev) => ({ ...prev, [selectedAgentId]: id }))}
             onDeleteTask={handleDeleteTask}
             onSend={handleSend}
@@ -203,6 +208,7 @@ export default function App() {
           policies={policies}
           entityTypes={entityTypes}
           edgeTypes={edgeTypes}
+          tools={tools}
           onRefresh={() => getPolicies().then(setPolicies).catch(console.error)}
         />
       )}

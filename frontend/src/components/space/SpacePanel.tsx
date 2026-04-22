@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback, type KeyboardEvent } from 'react'
 import ReactMarkdown from 'react-markdown'
-import type { AgentSpec, Task, Message, Entity } from '../../types'
+import type { AgentSpec, Task, Message, Entity, Delegation } from '../../types'
+import { getDelegations } from '../../api'
 
 interface SpacePanelProps {
   agent: AgentSpec | undefined
@@ -9,6 +10,7 @@ interface SpacePanelProps {
   messages: Message[]
   entities: Entity[]
   isStreaming?: boolean
+  currentRunId?: string
   onTaskSelect: (id: string) => void
   onDeleteTask: (id: string) => void
   onSend: (text: string) => void
@@ -42,7 +44,7 @@ function ToolCallRow({ toolCall }: { toolCall: { id: string; tool: string; args:
       <div onClick={() => setOpen((v) => !v)}
         style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '4px 8px', cursor: 'pointer', userSelect: 'none' }}>
         <span style={{ fontSize: '9px', color: 'var(--color-text-dim)' }}>{open ? '▾' : '▸'}</span>
-        <span style={{ fontFamily: 'var(--font-mono)', fontSize: '11px', color: 'var(--color-warning)' }}>{toolCall.tool}</span>
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: '11px', color: 'var(--color-warning)' }}>{toolCall.tool.replace(/^mcp__[^_]+__/, '')}</span>
       </div>
       {open && (
         <div style={{ padding: '6px 8px', fontFamily: 'var(--font-mono)', fontSize: '10px', color: 'var(--color-text-muted)', borderTop: '1px solid var(--color-border)', whiteSpace: 'pre-wrap', wordBreak: 'break-all', maxHeight: '120px', overflowY: 'auto', lineHeight: 1.7 }}>
@@ -165,12 +167,24 @@ const TYPE_DOTS: Record<string, string> = {
   Task: '#A78BFA', Agent: '#F472B6', Run: '#38BDF8',
 }
 
-export function SpacePanel({ agent, tasks, selectedTaskId, messages, entities, isStreaming = false, onTaskSelect, onDeleteTask, onSend, builderOpen, onToggleBuilder }: SpacePanelProps) {
+export function SpacePanel({ agent, tasks, selectedTaskId, messages, entities, isStreaming = false, currentRunId, onTaskSelect, onDeleteTask, onSend, builderOpen, onToggleBuilder }: SpacePanelProps) {
   const [inputValue, setInputValue] = useState('')
+  const [delegations, setDelegations] = useState<Delegation[]>([])
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const pollRef = useRef<number | null>(null)
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages])
+
+  useEffect(() => {
+    if (pollRef.current !== null) { clearInterval(pollRef.current); pollRef.current = null }
+    if (!currentRunId) { setDelegations([]); return }
+    getDelegations(currentRunId).then(setDelegations).catch(() => {})
+    pollRef.current = window.setInterval(() => {
+      getDelegations(currentRunId).then(setDelegations).catch(() => {})
+    }, 2000)
+    return () => { if (pollRef.current !== null) { clearInterval(pollRef.current); pollRef.current = null } }
+  }, [currentRunId])
 
   const handleSend = useCallback(() => {
     const text = inputValue.trim(); if (!text) return
@@ -314,6 +328,27 @@ export function SpacePanel({ agent, tasks, selectedTaskId, messages, entities, i
                 </>
               )}
             </div>
+
+            {/* Delegations */}
+            {delegations.length > 0 && (
+              <div style={{ padding: '0.5rem 1rem', borderTop: '1px solid var(--border, #e2e8f0)', fontSize: '0.8rem' }}>
+                <div style={{ fontWeight: 600, marginBottom: '0.25rem', color: 'var(--text-muted, #94a3b8)' }}>
+                  Delegations
+                </div>
+                {delegations.map(d => (
+                  <div key={d.id} style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginBottom: '0.15rem' }}>
+                    <span style={{
+                      padding: '1px 6px', borderRadius: 10, fontSize: '0.7rem',
+                      background: d.status === 'completed' ? '#22c55e22' : d.status === 'failed' ? '#ef444422' : '#3b82f622',
+                      color: d.status === 'completed' ? '#16a34a' : d.status === 'failed' ? '#dc2626' : '#2563eb',
+                    }}>
+                      {d.status}
+                    </span>
+                    <span>→ agent</span>
+                  </div>
+                ))}
+              </div>
+            )}
 
             {/* Input */}
             <div style={{ padding: '10px 16px 14px', borderTop: '1px solid var(--color-border)', flexShrink: 0, background: 'var(--color-surface)' }}>
