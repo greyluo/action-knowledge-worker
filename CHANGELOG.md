@@ -95,6 +95,22 @@ original design doc.
 
 ---
 
+## Session 3 — Explicit Relationships and UI Polish
+
+### New features
+
+#### 11. `remember_entity` accepts explicit relationships
+
+**Problem**: Agents could only persist edges through the LLM-driven PostToolUse extraction path, which infers relationships from tool output text. Explicitly known relationships (e.g. "this person borrows this book") had no direct write path.
+**Solution**: Added optional `relationships` list to `remember_entity(name, type_hint, properties, relationships)`. Each entry specifies `target_name`, `target_type`, `edge_type`, and `direction` (`to_target` or `from_target`). The ontologist processes these alongside the primary entity — target entities go through the same identity-resolution path, and edges are persisted immediately.
+**Library-agent prompt** updated to instruct the agent to call `remember_entity` twice when lending a book: once to record the Person with a `borrows` relationship to the Book, once to update the Book's status to `borrowed`.
+
+#### 12. Entity types polled and auto-shown in ontology view
+**Problem**: New entity types created during a run were not reflected in the ontology view filter panel without a page refresh, and newly appearing types were hidden by default.
+**Fix**: `getEntityTypes` added to the 3-second polling interval in `App.tsx`. `OntologyView` now runs a `useEffect` that adds any type not yet in `shownTypes` — so new types appear automatically without overriding explicit user unchecks.
+
+---
+
 ## Current State
 
 - **Tests**: 26 passed, 0 errors (as of Session 2)
