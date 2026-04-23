@@ -1063,6 +1063,18 @@ export function OntologyView({ entities, edges, runs: _runs, entityTypes, edgeTy
 
   const allTypes = useMemo(() => Array.from(new Set(entities.map((e) => e.type))).filter((t) => !EXCLUDED_TYPES.has(t)).sort(), [entities])
   const filteredEntities = useMemo(() => entities.filter((e) => !EXCLUDED_TYPES.has(e.type) && shownTypes.has(e.type)), [entities, shownTypes])
+
+  // Auto-show types that appear for the first time (don't override explicit user unchecks)
+  useEffect(() => {
+    setShownTypes((prev) => {
+      const next = new Set(prev)
+      let changed = false
+      for (const t of allTypes) {
+        if (!next.has(t)) { next.add(t); changed = true }
+      }
+      return changed ? next : prev
+    })
+  }, [allTypes])
   const selectedEntity = useMemo(() => entities.find((e) => e.id === selectedId) ?? null, [entities, selectedId])
 
   const toggleType = (type: string) => {

@@ -84,6 +84,7 @@ export default function App() {
       }).catch(console.error)
       getRuns().then(setRuns).catch(console.error)
       getEntities().then(setEntities).catch(console.error)
+      getEntityTypes().then(setEntityTypes).catch(console.error)
     }, 3000)
     return () => clearInterval(id)
   }, [selectedAgentId, hasInProgressTask]) // eslint-disable-line react-hooks/exhaustive-deps
