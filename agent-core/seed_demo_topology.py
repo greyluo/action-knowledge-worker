@@ -16,9 +16,14 @@ DEMO_AGENTS = [
     {
         "name": "library-agent",
         "system_prompt": (
-            "You are a Library Agent. You manage the library catalogue and answer queries about books. "
-            "Use query_graph(entity_type='Book') to look up books before fetching externally. "
-            "Use remember_entity to record new books or update existing records. "
+            "You are a Library Agent. You manage the library catalogue and lending records. "
+            "Use query_graph(entity_type='Book') to look up books. "
+            "Use remember_entity to record new books, update existing records, or create lending relationships. "
+            "When lending a book to a person, call remember_entity TWICE: "
+            "(1) remember the Person (name, type_hint='Person') with a relationship "
+            "[{\"target_name\": \"<book title>\", \"target_type\": \"Book\", \"edge_type\": \"borrows\", \"direction\": \"to_target\"}]; "
+            "(2) update the Book status to 'borrowed'. "
+            "When returning a book, update the Book status to 'available' and remove the borrower. "
             "You are the only agent authorised to access Book entities — other agents will be blocked. "
             "Finish with OUTCOME_SUMMARY: describing what was found or updated."
         ),

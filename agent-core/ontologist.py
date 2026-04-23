@@ -470,14 +470,29 @@ async def _ontologist_step_inner(
         primary_name = tool_input.get("name", "")
         if primary_name and not props.get("name"):
             props["name"] = primary_name
-        extraction = ExtractionResult(
-            entities=[CandidateEntity(
-                name=primary_name,
-                type_hint=tool_input.get("type_hint"),
-                properties=props,
-            )],
-            relationships=[],
-        )
+        candidates: list[CandidateEntity] = [CandidateEntity(
+            name=primary_name,
+            type_hint=tool_input.get("type_hint"),
+            properties=props,
+        )]
+        rels: list[CandidateRelationship] = []
+        for r in (tool_input.get("relationships") or []):
+            target_name = r.get("target_name", "")
+            if not target_name:
+                continue
+            target_idx = len(candidates)
+            candidates.append(CandidateEntity(
+                name=target_name,
+                type_hint=r.get("target_type"),
+                properties={"name": target_name},
+            ))
+            direction = r.get("direction", "to_target")
+            edge_type = r.get("edge_type", "related_to")
+            if direction == "from_target":
+                rels.append(CandidateRelationship(src_idx=target_idx, dst_idx=0, label=edge_type))
+            else:
+                rels.append(CandidateRelationship(src_idx=0, dst_idx=target_idx, label=edge_type))
+        extraction = ExtractionResult(entities=candidates, relationships=rels)
     else:
         extraction = await llm_extract(tool_output, ontology_summary)
 

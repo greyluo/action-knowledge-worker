@@ -191,11 +191,15 @@ async def terminate_employee(args: dict[str, Any]) -> dict[str, Any]:
 @tool(
     "remember_entity",
     (
-        "Persist a fact about a person, company, or deal to ontology. "
+        "Persist a fact about a person, company, deal, or other entity to the ontology. "
         "Call this when the user provides information that should be remembered "
         "(e.g. a name change, a new contact, an updated deal status). "
+        "Optionally include relationships to link this entity to others — "
+        "e.g. [{\"target_name\": \"Grey\", \"target_type\": \"Person\", "
+        "\"edge_type\": \"borrows\", \"direction\": \"from_target\"}]. "
+        "direction 'to_target' means this entity→target; 'from_target' means target→this entity."
     ),
-    {"name": str, "type_hint": str, "properties": dict},
+    {"name": str, "type_hint": str, "properties": dict, "relationships": list},
     annotations=ToolAnnotations(readOnlyHint=False),
 )
 async def remember_entity(args: dict[str, Any]) -> dict[str, Any]:
